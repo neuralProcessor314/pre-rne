@@ -25,8 +25,8 @@ CFG = {
     "gpu": True,
     # Augmentation, applied to whole images after normalisation and before Cellpose.
     # Each non-test image is also saved as aug_copies augmented copies; strengths are drawn from 0 up to these maxima.
-    "seed": None,                   # int: seed for the augmentation draws
-    "aug_copies": None,             # int: augmented copies per image, besides the original
+    "seed": 42,                     # int: seed for the augmentation draws
+    "aug_copies": 3,                # int: augmented copies per image, besides the original
     "aug_ca_max_shift_px": 4,       # int: chromatic aberration, max shift of R and B against G, in pixels
     "aug_illum_max_slope": 0.5,     # float: uneven illumination, max brightness change from image centre to edge (0.1 = 10 %)
     "aug_blur_max_sigma": 1.5,      # float: Gaussian blur, max sigma in pixels
