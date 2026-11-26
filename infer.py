@@ -7,6 +7,7 @@ from train import (
     CHANNELS,
     CLASSES,
     FOLD_COLUMNS,
+    POOLINGS,
     BatchTopKSAE,
     TransformerDecoder,
     build_fold,
@@ -55,7 +56,7 @@ def load_fold_models(ckpt, te, device):
     td.load_state_dict(ckpt["td"])
     td.eval()
 
-    lc = nn.Linear(CHANNELS * cfg["d_sae"], len(CLASSES)).to(device)
+    lc = nn.Linear(len(POOLINGS) * CHANNELS * cfg["d_sae"], len(CLASSES)).to(device)
     lc.load_state_dict(ckpt["lc"])
     lc.eval()
 

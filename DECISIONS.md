@@ -26,6 +26,8 @@
 14. **Magnification**: Use 20x images at their native scale. exp3's images are labelled "40x" but were taken at 20x. 4x and 10x images are dropped. A single cell is about 120 × 120 px including dendrites.
 15. **Before/After Pairing Pending**: The current images do not cover both phases in any experiment (exp1 has only after images; exp2 and exp3 only before images). Until more images arrive, train with what exists: `LC` classifies single after cells, and before cells train only the `SAE` and `TD`.
 16. **Plate Rows**: The plate rows hold `RD`, `RF`, `DD`, `DF` from top to bottom, in every experiment.
+17. **LC Pooling, Mean and Max Side by Side**: For each channel, `LC` reads the SAE latents averaged over the crop's patches and their maxima over the patches, joined into one vector of 2 × 3 × `d_sae` values (all means first, then all maxima).
+18. **Hyperparameters from Published Work**: The empty hyperparameters are filled with values from published work (see Hyperparameters). `seed` is 42. Epochs are set for a first run of about 40 minutes on the RTX 5070 Ti.
 
 ## Derived Architecture and Pipeline Assumptions
 
@@ -57,8 +59,8 @@
 
 ### 6. Decoder and Classifier Tensor Routing (`TD` and `LC`)
 - Stage 2 trains `TD` (Transformer encoder blocks over `x_pred` followed by linear projection and `PixelShuffle(patch_size)`) per channel to reconstruct the 3-channel crop.
-- Stage 3 averages each after crop's patch-level `z` over its own `(H_p, W_p)` grid, concatenates the 3 channels into shape `(B, 3 * d_sae)`, and trains `LC` with 2 outputs (not ferroptotic, ferroptotic). With one `RD` condition against three others, the cross-entropy weights each class by 1 / (its share of training cells × 2), so both classes count equally. Pooled latents use the `theta` threshold and are computed once, since `TE`, `SAE` and the crops are fixed.
-- Averaging over patches removes cell size from the pooled latents; `LC` does not read `area`.
+- Stage 3 takes the mean and the maximum of each after crop's patch-level `z` over its own `(H_p, W_p)` grid, for each of the 3 channels, and joins them into shape `(B, 2 * 3 * d_sae)` (means, then maxima); `LC` is trained on it with 2 outputs (not ferroptotic, ferroptotic). With one `RD` condition against three others, the cross-entropy weights each class by 1 / (its share of training cells × 2), so both classes count equally. Pooled latents use the `theta` threshold and are computed once, since `TE`, `SAE` and the crops are fixed.
+- Neither the mean nor the maximum over patches keeps cell size; `LC` does not read `area`.
 
 ### 7. Variable Crop Sizes
 - Crops of different sizes cannot be stacked into one tensor. Stages 1 and 2 group crops by side length and draw each batch from one group; Stage 3 computes latents group by group; `infer.py` processes one cell at a time.
@@ -69,3 +71,71 @@
 - Steps, in order: rotation by 0/90/180/270° and a mirror flip half of the time; chromatic aberration, shifting R and B against G by up to `aug_ca_max_shift_px` pixels with edge pixels repeated; uneven illumination, multiplying the image by a linear ramp across it in a random direction with slope up to `aug_illum_max_slope`; Gaussian blur with sigma up to `aug_blur_max_sigma`; Gaussian noise with standard deviation up to `aug_noise_max_std`. Each strength is drawn uniformly from 0 to its maximum from a generator seeded by `seed`, the image name and the copy number; the result is clipped to [0, 1].
 - `train.py` uses augmented copies only while a well is a training well; for its held-out fold only the original crops are used. Training itself does no further augmentation.
 - Failure mode: augmentation is fixed when `segment.py` runs, so every epoch sees the same `1 + aug_copies` versions of each image; Cellpose runs `1 + aug_copies` times per image.
+
+## Hyperparameters
+
+Chosen from published work on request; `seed` (42) was set by hand. Batch sizes count crops, not tokens. Run speed on the RTX 5070 Ti has not been measured.
+
+### `segment.py`
+
+| Setting | Value | Source |
+|---|---|---|
+| `flow_threshold` | 0.4 | Cellpose `CellposeModel.eval` default (installed version 4.2.1.1) |
+| `cellprob_threshold` | 0.0 | Cellpose default |
+| `batch_size` | 8 | Cellpose default |
+| `min_mask_pixels` | 15 | Cellpose `min_size` default, so this filter removes nothing that Cellpose keeps |
+| `pad_px` | 16 | R-CNN context padding p = 16 (Girshick et al., 2014). R-CNN counts it in the 227 × 227 warped region; here it is native pixels, one DINOv3 patch |
+
+### `train.py`, Stage 1 (SAE)
+
+Defaults of the BatchTopK reference implementation (Bussmann et al., 2024), which trains on GPT-2 small activations of width 768, the same width as DINOv3 ViT-B/16 tokens.
+
+| Setting | Value | Source |
+|---|---|---|
+| `d_sae` | 12288 | BatchTopK default (16 × 768) |
+| `topk` | 32 | BatchTopK default |
+| `topk_aux` | 512 | BatchTopK default; Gao et al. (2024) choose a power of two near half the input width |
+| `aux_weight` | 1/32 | BatchTopK default; Gao et al. (2024) |
+| `dead_steps` | 5 | BatchTopK default (5 batches); Gao et al. (2024) use 10 million tokens |
+| `sae_lr` | 3e-4 | BatchTopK default |
+| `sae_batch_size` | 32 | BatchTopK uses 4,096 tokens per batch. At the median Cellpose crop sizes of six sample images (48 to 147 tokens per crop over 3 channels), 32 crops hold about 1,500 to 4,700 tokens; 32 crops of the largest size (272 px) hold about 27,700 |
+| `sae_epochs` | 1 | First 40-minute run; BatchTopK trains on 1 billion tokens |
+
+### Stage 2 (TD)
+
+Default MAE decoder (He et al., 2022): 8 blocks of width 512, 16 heads, MLP ratio 4, base learning rate 1.5e-4 per 256 images, scaled linearly with batch size.
+
+| Setting | Value | Source |
+|---|---|---|
+| `td_dim` | 512 | MAE decoder |
+| `td_heads` | 16 | MAE decoder |
+| `td_layers` | 8 | MAE decoder |
+| `td_mlp_dim` | 2048 | MAE decoder (4 × 512) |
+| `td_batch_size` | 32 | Same as `sae_batch_size`; 96 channel images per batch |
+| `td_lr` | 1.5e-4 × 96 / 256 = 5.625e-5 | MAE linear scaling rule, each channel image counted as one image |
+| `td_epochs` | 1 | First 40-minute run |
+
+### Stage 3 (LC)
+
+| Setting | Value | Source |
+|---|---|---|
+| `lc_batch_size` | 32 | Close to the batch of 30 in CellDeathPred (Schorpp et al., 2023); also the batch for computing pooled latents |
+| `lc_lr` | 1e-3 | Adam default step size (Kingma & Ba, 2015) |
+| `lc_weight_decay` | 0.0 | MAE linear probing (He et al., 2022) |
+| `lc_epochs` | 90 | MAE linear probing (He et al., 2022) |
+
+### Differences from the sources
+
+- SAE: tokens are not scaled to unit norm (BatchTopK scales its inputs); decoder columns are not renormalised and `b_dec` starts at zero (Gao et al. renormalise them and start the bias at the geometric median of the data); the optimiser is AdamW with PyTorch defaults (betas 0.9 and 0.999, weight decay 0.01), while BatchTopK uses Adam with betas 0.9 and 0.99.
+- TD: AdamW with PyTorch defaults at a constant learning rate; MAE uses betas 0.9 and 0.95, weight decay 0.05 and cosine decay with warm-up, and adds positional embeddings to the decoder input.
+- LC: AdamW instead of LARS, and no BatchNorm on the inputs (MAE's linear probe adds BatchNorm without affine parameters). LC has 6 × 12288 = 73,728 inputs, more than there are training after cells, so with no weight decay it can overfit.
+
+## References
+
+- Bussmann, B., Leask, P., & Nanda, N. (2024). *BatchTopK sparse autoencoders* (arXiv:2412.06410). arXiv. https://doi.org/10.48550/arXiv.2412.06410
+- Gao, L., Dupré la Tour, T., Tillman, H., Goh, G., Troll, R., Radford, A., Sutskever, I., Leike, J., & Wu, J. (2024). *Scaling and evaluating sparse autoencoders* (arXiv:2406.04093). arXiv. https://doi.org/10.48550/arXiv.2406.04093
+- Girshick, R., Donahue, J., Darrell, T., & Malik, J. (2014). Rich feature hierarchies for accurate object detection and semantic segmentation. In *Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition* (pp. 580–587). https://doi.org/10.1109/CVPR.2014.81
+- He, K., Chen, X., Xie, S., Li, Y., Dollár, P., & Girshick, R. (2022). Masked autoencoders are scalable vision learners. In *Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition*. arXiv:2111.06377
+- Kingma, D. P., & Ba, J. (2015). Adam: A method for stochastic optimization. *International Conference on Learning Representations*. arXiv:1412.6980
+- Pachitariu, M., Rariden, M., & Stringer, C. (2025). *Cellpose-SAM: Superhuman generalization for cellular segmentation* [Preprint]. bioRxiv. https://doi.org/10.1101/2025.04.28.651001
+- Schorpp, K., Bessadok, A., Biibosunov, A., Rothenaigner, I., Strasser, S., Peng, T., & Hadian, K. (2023). CellDeathPred: A deep learning framework for ferroptosis and apoptosis prediction based on cell painting. *Cell Death Discovery, 9*, 277. https://doi.org/10.1038/s41420-023-01559-y

@@ -18,15 +18,16 @@ from plate import CODES, COLUMNS, CONCENTRATIONS, well_number, well_position
 #   3_<phase>_crops/                            one .pt file per cell
 # <phase> is "before" or "after". Running this script redoes all three steps; the 1_, 2_ and 3_ folders
 # are deleted and written again each time.
+# Cellpose and crop settings: sources in DECISIONS.md, Hyperparameters
 CFG = {
     "data_dir": Path("data"),
     "bf_mean": 0.5,             # float: mean of each R, G, B channel after normalisation (0.5 = 128 of 255)
     "bf_std": 0.25,             # float: standard deviation (contrast) of each channel after normalisation
-    "min_mask_pixels": None,    # int: minimum cell mask area
-    "pad_px": None,             # int: bounding-box padding in pixels
-    "flow_threshold": None,     # float: Cellpose flow error threshold
-    "cellprob_threshold": None, # float: Cellpose cell probability threshold
-    "batch_size": None,         # int: Cellpose evaluation batch size
+    "min_mask_pixels": 15,      # int: minimum cell mask area
+    "pad_px": 16,               # int: bounding-box padding in pixels
+    "flow_threshold": 0.4,      # float: Cellpose flow error threshold
+    "cellprob_threshold": 0.0,  # float: Cellpose cell probability threshold
+    "batch_size": 8,            # int: Cellpose evaluation batch size
     "gpu": True,
     # Augmentation, applied to whole images after normalisation and before Cellpose.
     # Each image is also saved as aug_copies augmented copies; strengths are drawn from 0 up to these maxima.

@@ -6,36 +6,36 @@ import torch.nn.functional as F
 
 from plate import well_position
 
-# Model dimensions, paths, and training hyperparameters
+# Model dimensions, paths, and training hyperparameters (sources: DECISIONS.md, Hyperparameters)
 CFG = {
     "dinov3_repo_dir": None,    # str: path to local facebookresearch/dinov3 clone
     "dinov3_weights": str(Path.home() / "Documents" / "models" / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
     "data_dir": Path("data"),          # crops are read from data/3_before_crops and data/3_after_crops
     "ckpt_dir": Path("checkpoints"),    # one checkpoint per fold: fold1.pt ... fold4.pt
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "seed": None,               # int: RNG seed
+    "seed": 42,               # int: RNG seed
     # Stage 1: SAE
-    "d_sae": None,              # int: SAE latent dictionary size
-    "topk": None,               # int: average active latents per token (BatchTopK)
-    "topk_aux": None,           # int: active dead latents in auxiliary loss
-    "dead_steps": None,         # int: steps without firing before latent is dead
-    "aux_weight": None,         # float: weight on TopK_aux loss
-    "sae_batch_size": None,     # int
-    "sae_epochs": None,         # int
-    "sae_lr": None,             # float
+    "d_sae": 12288,             # int: SAE latent dictionary size
+    "topk": 32,                 # int: average active latents per token (BatchTopK)
+    "topk_aux": 512,            # int: active dead latents in auxiliary loss
+    "dead_steps": 5,            # int: steps without firing before latent is dead
+    "aux_weight": 1 / 32,       # float: weight on TopK_aux loss
+    "sae_batch_size": 32,       # int: crops per batch
+    "sae_epochs": 1,            # int
+    "sae_lr": 3e-4,             # float
     # Stage 2: Transformer Decoder (TD)
-    "td_dim": None,             # int: TD transformer hidden dimension
-    "td_heads": None,           # int: TD attention heads
-    "td_layers": None,          # int: TD transformer layer count
-    "td_mlp_dim": None,         # int: TD feedforward dimension
-    "td_batch_size": None,      # int
-    "td_epochs": None,          # int
-    "td_lr": None,              # float
+    "td_dim": 512,              # int: TD transformer hidden dimension
+    "td_heads": 16,             # int: TD attention heads
+    "td_layers": 8,             # int: TD transformer layer count
+    "td_mlp_dim": 2048,         # int: TD feedforward dimension
+    "td_batch_size": 32,        # int: crops per batch, 3 channel images each
+    "td_epochs": 1,             # int
+    "td_lr": 1.5e-4 * 96 / 256, # float: MAE base lr scaled to 96 channel images per batch
     # Stage 3: Linear Classifier (LC)
-    "lc_batch_size": None,      # int
-    "lc_epochs": None,          # int
-    "lc_lr": None,              # float
-    "lc_weight_decay": None,    # float
+    "lc_batch_size": 32,        # int: crops per batch
+    "lc_epochs": 90,            # int
+    "lc_lr": 1e-3,              # float
+    "lc_weight_decay": 0.0,     # float
 }
 
 # RD (RSL3 + DMSO) is the only ferroptotic condition: LC predicts ferroptotic (1, RD) or
@@ -43,6 +43,7 @@ CFG = {
 FERROPTOTIC_CODE = "RD"
 CLASSES = ["not ferroptotic", "ferroptotic"]
 CHANNELS = 3        # R, G, B, each tokenised by TE as its own grayscale image
+POOLINGS = ["mean", "max"]     # LC input: SAE latents pooled over patches both ways, side by side
 
 # Leave-one-well-out folds: fold k holds out the wells in plate column FOLD_COLUMNS[k] of every
 # condition (one well per condition, in every experiment) and trains on the other three columns
@@ -173,11 +174,13 @@ def encode_channels(te, imgs):
     return tokens, hp, wp
 
 
-# Average SAE latents over patches: (B*C*T, d_sae) -> (B, C*d_sae)
+# Pool SAE latents over patches, mean and max side by side: (B*C*T, d_sae) -> (B, 2*C*d_sae)
+# The first C*d_sae values are the means, the last C*d_sae values the maxima
 def pool_over_patches(z, b, c, t):
     z = z.reshape(b, c, t, -1)
-    z = z.mean(dim=2)
-    return z.reshape(b, -1)
+    mean = z.mean(dim=2).reshape(b, -1)
+    peak = z.max(dim=2).values.reshape(b, -1)
+    return torch.cat([mean, peak], dim=1)
 
 
 # Sparse autoencoder with tied decoder bias, BatchTopK, TopK_aux, and a threshold for inference
@@ -357,7 +360,7 @@ def train_td(te, sae, image_paths, device):
     return td
 
 
-# Patch-averaged SAE latents of each crop: {path: Tensor[CHANNELS * d_sae]}
+# Mean- and max-pooled SAE latents of each crop: {path: Tensor[2 * CHANNELS * d_sae]}
 # Uses the inference threshold (as infer.py does), so a crop's latents do not depend on
 # which other crops share its batch.
 def pooled_latents(te, sae, groups, batch_size, device):
@@ -377,7 +380,7 @@ def pooled_latents(te, sae, groups, batch_size, device):
     return latents
 
 
-# Stage 3: train LC (ferroptotic or not) on the patch-averaged SAE latents of single after cells
+# Stage 3: train LC (ferroptotic or not) on the mean- and max-pooled SAE latents of single after cells
 # (TE and SAE frozen)
 def train_lc(te, sae, cells, device):
     paths = []
@@ -397,7 +400,7 @@ def train_lc(te, sae, cells, device):
         class_weights.append(len(labels) / (len(CLASSES) * count))
     class_weights = torch.tensor(class_weights, device=device)
 
-    lc = nn.Linear(CHANNELS * CFG["d_sae"], len(CLASSES)).to(device)
+    lc = nn.Linear(len(POOLINGS) * CHANNELS * CFG["d_sae"], len(CLASSES)).to(device)
     optimizer = torch.optim.AdamW(lc.parameters(), lr=CFG["lc_lr"], weight_decay=CFG["lc_weight_decay"])
 
     # TE and SAE are frozen and crops are fixed, so every crop's latents are computed once
@@ -405,7 +408,7 @@ def train_lc(te, sae, cells, device):
     features = []
     for path in paths:
         features.append(latents[path])
-    features = torch.stack(features)                          # (N, CHANNELS * d_sae)
+    features = torch.stack(features)                          # (N, 2 * CHANNELS * d_sae)
 
     lc.train()
     for epoch in range(CFG["lc_epochs"]):
