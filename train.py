@@ -1,4 +1,5 @@
 from pathlib import Path
+import math
 import random
 import torch
 import torch.nn as nn
@@ -14,6 +15,11 @@ CFG = {
     "val_well_frac": None,      # float: fraction of wells per control condition for val
     "seed": None,               # int: RNG seed
     "max_pair_dist_px": None,   # float: max centroid distance for before/after pairing
+    # Training augmentation (all three stages; strengths are drawn uniformly from 0 to these maxima)
+    "aug_ca_max_shift_px": None,    # int: chromatic aberration, max shift of R and B against G, in pixels
+    "aug_illum_max_slope": None,    # float: uneven illumination, max brightness change from crop centre to edge (0.1 = 10 %)
+    "aug_blur_max_sigma": None,     # float: Gaussian blur, max sigma in pixels
+    "aug_noise_max_std": None,      # float: Gaussian noise, max standard deviation (intensities are 0-1)
     # Stage 1: SAE
     "d_sae": None,              # int: SAE latent dictionary size
     "topk": None,               # int: average active latents per token (BatchTopK)
@@ -169,12 +175,93 @@ def make_batches(groups, batch_size, rng):
     return batches
 
 
-# Load the images of same-sized crops as one tensor (B, 4, side, side)
-def load_images(paths):
+# Load the images of same-sized crops as one tensor (B, 4, side, side), augmented if asked
+def load_images(paths, use_augmentation=False):
     images = []
     for path in paths:
-        images.append(torch.load(path, weights_only=True)["image"])
+        image = torch.load(path, weights_only=True)["image"]
+        if use_augmentation:
+            is_before = path.parent.parent.name == "before"
+            image = augment_crop(image, is_before)
+        images.append(image)
     return torch.stack(images)
+
+
+# ---------------- Augmentation (training only) ----------------
+
+# Random integer from -limit to +limit
+def random_int(limit):
+    return int(torch.randint(-limit, limit + 1, (1,)))
+
+
+# Random float from 0 to limit
+def random_up_to(limit):
+    return float(torch.rand(1)) * limit
+
+
+# Shift one channel (H, W) by (dy, dx) pixels; the uncovered edge repeats the nearest edge pixels
+def shift_channel(channel, dy, dx):
+    m = max(abs(dy), abs(dx))
+    if m == 0:
+        return channel
+    h, w = channel.shape
+    padded = F.pad(channel[None, None], (m, m, m, m), mode="replicate")[0, 0]
+    return padded[m - dy:m - dy + h, m - dx:m - dx + w]
+
+
+# Blur every channel of a (C, H, W) image with a Gaussian of the given sigma (pixels)
+def gaussian_blur(image, sigma):
+    side = image.shape[-1]
+    half = min(int(math.ceil(3 * sigma)), side - 1)     # kernel reaches 3 sigma, but not past the crop
+    xs = torch.arange(-half, half + 1, dtype=image.dtype)
+    kernel = torch.exp(-xs ** 2 / (2 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+
+    c = image.shape[0]
+    x = image[:, None]                                                  # (C, 1, H, W)
+    x = F.pad(x, (half, half, half, half), mode="reflect")
+    x = F.conv2d(x, kernel.reshape(1, 1, 1, -1))                        # blur along width
+    x = F.conv2d(x, kernel.reshape(1, 1, -1, 1))                        # blur along height
+    return x.reshape(c, image.shape[1], image.shape[2])
+
+
+# One random augmentation of a crop (4, S, S): channels 0-2 brightfield R, G, B, channel 3 BODIPY.
+# Before crops have no BODIPY image (channel 3 is all zero), so it gets no noise.
+def augment_crop(image, is_before):
+    image = image.clone()
+
+    # Rotation by 0, 90, 180 or 270 degrees, then a mirror flip half of the time (exact, no new pixels)
+    turns = int(torch.randint(0, 4, (1,)))
+    image = torch.rot90(image, turns, dims=(1, 2))
+    if float(torch.rand(1)) < 0.5:
+        image = torch.flip(image, dims=(2,))
+
+    # Chromatic aberration: R and B shifted a few pixels against G
+    m = CFG["aug_ca_max_shift_px"]
+    image[0] = shift_channel(image[0], random_int(m), random_int(m))
+    image[2] = shift_channel(image[2], random_int(m), random_int(m))
+
+    # Uneven illumination: brightfield multiplied by a brightness ramp in a random direction
+    side = image.shape[-1]
+    coords = torch.linspace(-1.0, 1.0, side)
+    ys, xs = torch.meshgrid(coords, coords, indexing="ij")
+    angle = random_up_to(2 * math.pi)
+    slope = random_up_to(CFG["aug_illum_max_slope"])
+    ramp = 1.0 + slope * (xs * math.cos(angle) + ys * math.sin(angle))
+    image[0:3] = image[0:3] * ramp
+
+    # Out-of-focus blur on all channels
+    sigma = random_up_to(CFG["aug_blur_max_sigma"])
+    if sigma > 0:
+        image = gaussian_blur(image, sigma)
+
+    # Camera noise
+    std = random_up_to(CFG["aug_noise_max_std"])
+    image[0:3] = image[0:3] + torch.randn_like(image[0:3]) * std
+    if not is_before:
+        image[3] = image[3] + torch.randn_like(image[3]) * std
+
+    return image.clamp(0.0, 1.0)
 
 
 # ---------------- Models ----------------
@@ -345,7 +432,7 @@ def train_sae(te, image_paths, device):
     sae.train()
     for epoch in range(CFG["sae_epochs"]):
         for batch_paths in make_batches(groups, CFG["sae_batch_size"], rng):
-            imgs = load_images(batch_paths)
+            imgs = load_images(batch_paths, use_augmentation=True)
             tokens, hp, wp = encode_four_channels(te, imgs.to(device))
             tokens = tokens.reshape(-1, d_in)       # all patch tokens of all channels
             recon_loss, aux_loss = sae.training_losses(tokens)
@@ -377,7 +464,7 @@ def train_td(te, sae, image_paths, device):
     td.train()
     for epoch in range(CFG["td_epochs"]):
         for batch_paths in make_batches(groups, CFG["td_batch_size"], rng):
-            imgs = load_images(batch_paths).to(device)
+            imgs = load_images(batch_paths, use_augmentation=True).to(device)   # TD rebuilds the augmented crop
             with torch.no_grad():
                 tokens, hp, wp = encode_four_channels(te, imgs)
                 b, c, t, d = tokens.shape
@@ -397,15 +484,14 @@ def train_td(te, sae, image_paths, device):
 # Patch-averaged SAE latents of each crop: {path: Tensor[4 * d_sae]}
 # Uses the inference threshold (as infer.py does), so a crop's latents do not depend on
 # which other crops share its batch. Before and after crops of one cell usually differ in size.
-def pooled_latents(te, sae, paths, batch_size, device):
-    groups = group_by_side(paths)
+def pooled_latents(te, sae, groups, batch_size, device, use_augmentation):
     latents = {}
     with torch.no_grad():
         for side in sorted(groups):
             group = groups[side]
             for start in range(0, len(group), batch_size):
                 batch_paths = group[start:start + batch_size]
-                imgs = load_images(batch_paths).to(device)
+                imgs = load_images(batch_paths, use_augmentation).to(device)
                 tokens, hp, wp = encode_four_channels(te, imgs)
                 b, c, t, d = tokens.shape
                 z = sae.encode_threshold(tokens.reshape(-1, d))
@@ -417,7 +503,6 @@ def pooled_latents(te, sae, paths, batch_size, device):
 
 # Stage 3: train LC on the before -> after change of patch-averaged SAE latents (TE and SAE frozen)
 def train_lc(te, sae, pairs, device):
-    # TE and SAE are frozen, so every crop's latents are computed once and reused in every epoch
     crop_paths = []
     seen = set()
     for before_path, after_path, label in pairs:
@@ -425,14 +510,11 @@ def train_lc(te, sae, pairs, device):
             if path not in seen:
                 seen.add(path)
                 crop_paths.append(path)
-    latents = pooled_latents(te, sae, crop_paths, CFG["lc_batch_size"], device)
+    groups = group_by_side(crop_paths)
 
-    features = []
     labels = []
     for before_path, after_path, label in pairs:
-        features.append(latents[after_path] - latents[before_path])
         labels.append(label)
-    features = torch.stack(features)                          # (N, 4 * d_sae)
     labels = torch.tensor(labels, device=device)
 
     lc = nn.Linear(4 * CFG["d_sae"], len(CONTROL_CLASSES)).to(device)
@@ -440,6 +522,14 @@ def train_lc(te, sae, pairs, device):
 
     lc.train()
     for epoch in range(CFG["lc_epochs"]):
+        # Each epoch sees a fresh augmentation of every crop, so the latents are recomputed
+        # (before and after crops of a pair are augmented independently)
+        latents = pooled_latents(te, sae, groups, CFG["lc_batch_size"], device, use_augmentation=True)
+        features = []
+        for before_path, after_path, label in pairs:
+            features.append(latents[after_path] - latents[before_path])
+        features = torch.stack(features)                      # (N, 4 * d_sae)
+
         order = torch.randperm(len(labels), device=device)
         for start in range(0, len(labels), CFG["lc_batch_size"]):
             idx = order[start:start + CFG["lc_batch_size"]]

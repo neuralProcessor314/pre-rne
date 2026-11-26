@@ -12,7 +12,8 @@ CFG = {
     "crop_dir": Path("data/crops"),
     "row_codes": None,          # list[str]: condition code of plate rows 1-4, e.g. ["RD", "DD", "RF", "DF"]
     "fluo_weights": None,       # (wR, wG, wB): BODIPY channel = wR*R + wG*G + wB*B
-    "bf_white": None,           # float: brightfield transmittance that becomes 1.0
+    "bf_mean": 0.5,             # float: mean of each brightfield channel after normalisation (0.5 = 128 of 255)
+    "bf_std": None,             # float: standard deviation (contrast) of each brightfield channel after normalisation
     "min_mask_pixels": None,    # int: minimum cell-group mask area
     "pad_px": None,             # int: bounding-box padding in pixels
     "flow_threshold": None,     # float: Cellpose flow error threshold
@@ -122,20 +123,15 @@ def index_images():
     return before, after, bodipy
 
 
-# Background level of each brightfield channel for one set of images (before or after)
-# Backlight and RGB weights are the same within a set, so one value per channel is enough
-def set_background(names):
-    medians = []
-    for name in names:
-        rgb = load_rgb(name)
-        medians.append(np.median(rgb, axis=(1, 2)))
-    return np.median(np.array(medians), axis=0)
-
-
-# Divide each brightfield channel by its background, so the result is transmittance
-def normalise_brightfield(rgb, background):
+# Normalise one brightfield image: each of R, G, B gets mean bf_mean and standard deviation bf_std,
+# so mean colour and contrast are the same in every image
+def normalise_brightfield(rgb):
     for i in range(3):
-        rgb[i] = rgb[i] / background[i] / CFG["bf_white"]
+        mean = rgb[i].mean()
+        std = rgb[i].std()
+        if std == 0:
+            std = 1.0          # a perfectly flat channel is only shifted
+        rgb[i] = (rgb[i] - mean) / std * CFG["bf_std"] + CFG["bf_mean"]
     return np.clip(rgb, 0.0, 1.0)
 
 
@@ -218,9 +214,8 @@ def segment_all():
 
     # Before images: brightfield and an empty BODIPY channel (dye not added yet)
     if len(before) > 0:
-        background = set_background(list(before.values()))
         for (well, fov), name in sorted(before.items()):
-            rgb = normalise_brightfield(load_rgb(name), background)
+            rgb = normalise_brightfield(load_rgb(name))
             empty = np.zeros_like(rgb[0])
             stack = np.stack([rgb[0], rgb[1], rgb[2], empty])
             code = well.split("_")[0]
@@ -235,14 +230,13 @@ def segment_all():
             print("after image without BODIPY, skipped:", name)
 
     if len(pairs) > 0:
-        background = set_background(list(after.values()))
         bodipy_names = []
         for well, fov, name, fluo_name in pairs:
             bodipy_names.append(fluo_name)
         scale = bodipy_scale(bodipy_names)
 
         for well, fov, name, fluo_name in pairs:
-            rgb = normalise_brightfield(load_rgb(name), background)
+            rgb = normalise_brightfield(load_rgb(name))
             fluo = np.clip(load_bodipy(fluo_name) / scale, 0.0, 1.0)
             if fluo.shape != rgb[0].shape:
                 raise ValueError(f"brightfield and BODIPY sizes differ for {well} FOV {fov}")

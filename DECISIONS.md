@@ -18,7 +18,9 @@
    - Implement Cellpose-SAM segmentation in `segment.py` reading from `data/raw/`.
    - Provide minimal single-file PyTorch scripts for training (`train.py`) and inference (`infer.py`) with every hyperparameter, including model dimensions, left empty (`None`).
 7. **Inference Outputs**: Export `LC` predictions, pooled sparse latents `z`, baseline `TD` reconstructions, and latent-intervened `TD` reconstructions on `test` (`RD`).
-8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells.
+8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells. Segment single cells, not cell groups.
+9. **Per-Image Brightfield Normalisation**: Normalise each input image's mean RGB and contrast, centring each channel at 0.5 (128 on an 8-bit scale).
+10. **Training Augmentation**: Augment training crops in all three stages with rotation by multiples of 90° plus flips, Gaussian noise, Gaussian blur, and realistic microscope artefacts (chromatic aberration, uneven illumination). No crop augmentation.
 
 ## Derived Architecture and Pipeline Assumptions
 
@@ -31,9 +33,9 @@
 
 ### 2. Channel Separation and Intensity Conversion
 - `colorsep.bat` runs `magick <file> -alpha off -channel RGB -separate -define png:color-type=0 <stem>_c%d.png`, keeping the input bit depth; `segment.py` reads 8- or 16-bit from the PNG mode.
-- Brightfield pixel = backlight × gain_c × transmittance_c. Each channel is divided by its acquisition-set background (median over images of per-image channel medians), divided by `bf_white`, and clipped to [0, 1], leaving transmittance independent of backlight and RGB weights. One constant per set, not per image, because per-image medians shift with cell density, which differs by condition.
-- BODIPY channel = `fluo_weights · (R, G, B)`, divided by one global constant (largest per-image 99.9th percentile over all after BODIPY images), clipped to [0, 1]; intensities stay comparable across after images.
-- Failure mode: saturated pixels break the multiplicative brightfield model; BODIPY 581/591 C11 shifts emission from red to green on oxidation, so one linear channel cannot carry the oxidised/reduced ratio.
+- Brightfield: each of R, G, B in each image is shifted and scaled to mean `bf_mean` (0.5) and standard deviation `bf_std`, then clipped to [0, 1]. Cellpose segments these normalised channels.
+- BODIPY is not normalised per image: its channel = `fluo_weights · (R, G, B)`, divided by one global constant (largest per-image 99.9th percentile over all after BODIPY images), clipped to [0, 1], so intensity differences between conditions stay.
+- Failure mode: per-image normalisation also removes real brightness and contrast differences between images, such as those caused by different cell density; values beyond `bf_mean ± 0.5` clip. BODIPY 581/591 C11 shifts emission from red to green on oxidation, so one linear channel cannot carry the oxidised/reduced ratio.
 
 ### 3. Segmentation, Pairing, and Splits
 - `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), with the `cpsam` weights in Cellpose's default `<home>/.cellpose/models/`, pads each mask's bounding box by `pad_px`, and cuts a square window from the 4-channel stack with no resizing: the side is the padded box's longer side rounded up to a multiple of the 16-pixel patch size, the window is centred on the box, and it is shifted back inside the image where it would stick out (such cells sit off-centre). Cells whose square would be larger than the image are skipped. Neighbouring cells inside the window are not masked out. After brightfield images without a matching BODIPY file are skipped.
@@ -52,9 +54,13 @@
 
 ### 6. Decoder and Classifier Tensor Routing (`TD` and `LC`)
 - Stage 2 trains `TD` (Transformer encoder blocks over `x_pred` followed by linear projection and `PixelShuffle(patch_size)`) per channel to reconstruct the 4-channel crop.
-- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Because `TE` and `SAE` are frozen, each crop's pooled latents are computed once and reused every epoch.
+- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Pooled latents use the `theta` threshold and are recomputed each epoch because the crops are augmented anew (Section 8).
 - Averaging over patches removes cell size from the pooled latents; `LC` does not read `area`.
 
 ### 7. Variable Crop Sizes
 - Crops of different sizes cannot be stacked into one tensor. Stages 1 and 2 group crops by side length and draw each batch from one group; Stage 3 computes latents group by group; `infer.py` processes one before/after pair at a time.
 - Failure mode: a side length with few crops yields small batches, so `BatchTopK` there behaves closer to per-crop TopK.
+
+### 8. Training Augmentation
+- `train.py` `augment_crop` runs on every crop loaded for training (Stages 1, 2 and 3); `infer.py` never augments. Stage 2 reconstructs the augmented crop. Stage 3 recomputes every crop's pooled latents each epoch, augmenting the before and after crop of a pair independently.
+- Steps, in order: rotation by 0/90/180/270° and a mirror flip half of the time (all channels); chromatic aberration, shifting R and B against G by up to `aug_ca_max_shift_px` pixels with edge pixels repeated; uneven illumination, multiplying R, G, B by a linear ramp in a random direction with slope up to `aug_illum_max_slope`; Gaussian blur on all channels with sigma up to `aug_blur_max_sigma`; Gaussian noise with standard deviation up to `aug_noise_max_std` on R, G, B, and on BODIPY only for after crops (before crops have no BODIPY image). Each strength is drawn uniformly from 0 to its maximum; the result is clipped to [0, 1].
