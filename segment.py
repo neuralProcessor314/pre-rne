@@ -13,7 +13,7 @@ CFG = {
     "row_codes": None,          # list[str]: condition code of plate rows 1-4, e.g. ["RD", "DD", "RF", "DF"]
     "fluo_weights": None,       # (wR, wG, wB): BODIPY channel = wR*R + wG*G + wB*B
     "bf_mean": 0.5,             # float: mean of each brightfield channel after normalisation (0.5 = 128 of 255)
-    "bf_std": None,             # float: standard deviation (contrast) of each brightfield channel after normalisation
+    "bf_std": 0.25,             # float: standard deviation (contrast) of each brightfield channel after normalisation
     "min_mask_pixels": None,    # int: minimum cell-group mask area
     "pad_px": None,             # int: bounding-box padding in pixels
     "flow_threshold": None,     # float: Cellpose flow error threshold

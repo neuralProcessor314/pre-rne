@@ -16,10 +16,10 @@ CFG = {
     "seed": None,               # int: RNG seed
     "max_pair_dist_px": None,   # float: max centroid distance for before/after pairing
     # Training augmentation (all three stages; strengths are drawn uniformly from 0 to these maxima)
-    "aug_ca_max_shift_px": None,    # int: chromatic aberration, max shift of R and B against G, in pixels
-    "aug_illum_max_slope": None,    # float: uneven illumination, max brightness change from crop centre to edge (0.1 = 10 %)
-    "aug_blur_max_sigma": None,     # float: Gaussian blur, max sigma in pixels
-    "aug_noise_max_std": None,      # float: Gaussian noise, max standard deviation (intensities are 0-1)
+    "aug_ca_max_shift_px": 4,       # int: chromatic aberration, max shift of R and B against G, in pixels
+    "aug_illum_max_slope": 0.5,     # float: uneven illumination, max brightness change from crop centre to edge (0.1 = 10 %)
+    "aug_blur_max_sigma": 1.5,      # float: Gaussian blur, max sigma in pixels
+    "aug_noise_max_std": 0.06,      # float: Gaussian noise, max standard deviation (intensities are 0-1)
     # Stage 1: SAE
     "d_sae": None,              # int: SAE latent dictionary size
     "topk": None,               # int: average active latents per token (BatchTopK)
