@@ -1,0 +1,24 @@
+[project]
+name = "celldeath-pipeline"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "cellpose[gui]==4.2.1.1",
+    "dinov3",
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
+
+[tool.uv.sources]
+dinov3 = { git = "https://github.com/facebookresearch/dinov3", rev = "6876159a11b4df116f30f667f8c9888617df0751" }
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
