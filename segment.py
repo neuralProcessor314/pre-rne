@@ -1,6 +1,9 @@
 from pathlib import Path
+import math
+import zlib
 import numpy as np
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 import torch
 from cellpose import models
 
@@ -20,6 +23,14 @@ CFG = {
     "cellprob_threshold": None, # float: Cellpose cell probability threshold
     "batch_size": None,         # int: Cellpose evaluation batch size
     "gpu": True,
+    # Augmentation, applied to whole images after normalisation and before Cellpose.
+    # Each non-test image is also saved as aug_copies augmented copies; strengths are drawn from 0 up to these maxima.
+    "seed": None,                   # int: seed for the augmentation draws
+    "aug_copies": None,             # int: augmented copies per image, besides the original
+    "aug_ca_max_shift_px": 4,       # int: chromatic aberration, max shift of R and B against G, in pixels
+    "aug_illum_max_slope": 0.5,     # float: uneven illumination, max brightness change from image centre to edge (0.1 = 10 %)
+    "aug_blur_max_sigma": 1.5,      # float: Gaussian blur, max sigma in pixels
+    "aug_noise_max_std": 0.06,      # float: Gaussian noise, max standard deviation (intensities are 0-1)
 }
 
 PATCH_SIZE = 16     # DINOv3 ViT-B/16 patch side; crop sides must be a multiple of it
@@ -149,6 +160,73 @@ def bodipy_scale(names):
     return scale
 
 
+# ---------------- Augmentation (before Cellpose) ----------------
+
+# Random generator for one augmented copy of one field. The before and after image of the same
+# field and copy use the same generator, so they get the same rotation and the same strengths,
+# and their cells still line up for before/after pairing.
+def copy_generator(well, fov, copy):
+    key = f"{CFG['seed']}|{well}|{fov}|{copy}"
+    return np.random.default_rng(zlib.crc32(key.encode()))
+
+
+# Shift one channel (H, W) by (dy, dx) pixels; the uncovered edge repeats the nearest edge pixels
+def shift_channel(channel, dy, dx):
+    m = max(abs(dy), abs(dx))
+    if m == 0:
+        return channel
+    h, w = channel.shape
+    padded = np.pad(channel, m, mode="edge")
+    return padded[m - dy:m - dy + h, m - dx:m - dx + w]
+
+
+# One augmented copy of a normalised image stack (4, H, W): channels 0-2 brightfield R, G, B, channel 3 BODIPY.
+# A before image has no BODIPY image (channel 3 is all zero), so that channel gets no noise.
+def augment_stack(stack, rng, is_before):
+    # Draw every random choice first, always in this order, so before and after images match
+    turns = int(rng.integers(0, 4))
+    flip = rng.random() < 0.5
+    m = CFG["aug_ca_max_shift_px"]
+    shift_r = (int(rng.integers(-m, m + 1)), int(rng.integers(-m, m + 1)))
+    shift_b = (int(rng.integers(-m, m + 1)), int(rng.integers(-m, m + 1)))
+    angle = rng.random() * 2 * math.pi
+    slope = rng.random() * CFG["aug_illum_max_slope"]
+    sigma = rng.random() * CFG["aug_blur_max_sigma"]
+    noise_std = rng.random() * CFG["aug_noise_max_std"]
+
+    # Rotation by 0, 90, 180 or 270 degrees, then a mirror flip (all channels; exact, no new pixels)
+    out = np.rot90(stack, turns, axes=(1, 2))
+    if flip:
+        out = out[:, :, ::-1]
+    out = out.copy()
+
+    # Chromatic aberration: R and B shifted a few pixels against G
+    out[0] = shift_channel(out[0], shift_r[0], shift_r[1])
+    out[2] = shift_channel(out[2], shift_b[0], shift_b[1])
+
+    # Uneven illumination: brightfield multiplied by a brightness ramp in a random direction
+    height = out.shape[1]
+    width = out.shape[2]
+    ys = np.linspace(-1.0, 1.0, height)[:, None]
+    xs = np.linspace(-1.0, 1.0, width)[None, :]
+    ramp = 1.0 + slope * (xs * math.cos(angle) + ys * math.sin(angle))
+    out[0:3] = out[0:3] * ramp
+
+    # Out-of-focus blur on all channels
+    if sigma > 0:
+        for c in range(4):
+            out[c] = gaussian_filter(out[c], sigma, mode="reflect", truncate=3.0)
+
+    # Camera noise
+    out[0:3] = out[0:3] + rng.standard_normal(out[0:3].shape) * noise_std
+    if not is_before:
+        out[3] = out[3] + rng.standard_normal(out[3].shape) * noise_std
+
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+# ---------------- Segmentation and crops ----------------
+
 # Turn a padded bounding box into a square window of real image pixels (no resizing)
 # The side is the box's longer side rounded up to a multiple of PATCH_SIZE; the window is
 # centred on the box and moved back inside the image if it sticks out.
@@ -211,6 +289,18 @@ def segment_and_save(model, stack, out_dir, well, fov):
         torch.save({"image": crop, "centroid": centroid, "area": area}, out_path)
 
 
+# Segment an image and save its crops; outside the test condition, do the same for aug_copies
+# augmented copies, saved as FOV "<fov>-aug<copy>" (e.g. "3-aug1")
+def segment_with_copies(model, stack, out_dir, well, fov, is_before):
+    segment_and_save(model, stack, out_dir, well, fov)
+    code = well.split("_")[0]
+    if code == TEST_CODE:
+        return
+    for copy in range(1, CFG["aug_copies"] + 1):
+        augmented = augment_stack(stack, copy_generator(well, fov, copy), is_before)
+        segment_and_save(model, augmented, out_dir, well, f"{fov}-aug{copy}")
+
+
 # Build 4-channel images (brightfield R, G, B + BODIPY) and save cell crops for every FOV
 def segment_all():
     before, after, bodipy = index_images()
@@ -223,7 +313,7 @@ def segment_all():
             empty = np.zeros_like(rgb[0])
             stack = np.stack([rgb[0], rgb[1], rgb[2], empty])
             code = well.split("_")[0]
-            segment_and_save(model, stack, CFG["crop_dir"] / "before" / code, well, fov)
+            segment_with_copies(model, stack, CFG["crop_dir"] / "before" / code, well, fov, is_before=True)
 
     # After images: brightfield and the BODIPY image of the same well and FOV
     pairs = []
@@ -251,7 +341,7 @@ def segment_all():
                 group = "test"
             else:
                 group = "control"
-            segment_and_save(model, stack, CFG["crop_dir"] / group / code, well, fov)
+            segment_with_copies(model, stack, CFG["crop_dir"] / group / code, well, fov, is_before=False)
 
 
 if __name__ == "__main__":

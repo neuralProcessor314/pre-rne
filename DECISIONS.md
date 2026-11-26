@@ -20,7 +20,7 @@
 7. **Inference Outputs**: Export `LC` predictions, pooled sparse latents `z`, baseline `TD` reconstructions, and latent-intervened `TD` reconstructions on `test` (`RD`).
 8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells. Segment single cells, not cell groups.
 9. **Per-Image Brightfield Normalisation**: Normalise each input image's mean RGB and contrast, centring each channel at 0.5 (128 on an 8-bit scale).
-10. **Training Augmentation**: Augment training crops in all three stages with rotation by multiples of 90° plus flips, Gaussian noise, Gaussian blur, and realistic microscope artefacts (chromatic aberration, uneven illumination). No crop augmentation.
+10. **Augmentation Before Cellpose**: Augment whole images after normalisation and before Cellpose segmentation, with rotation by multiples of 90° plus flips, Gaussian noise, Gaussian blur, and realistic microscope artefacts (chromatic aberration, uneven illumination). No crop augmentation.
 11. **Concentration 1.0 Dropped**: Every cell at concentration 1.0 was already dead, so the 1.0 wells are not used. The remaining wells keep their 24-well plate numbers (1–4, 7–10, 13–16, 19–22).
 
 ## Derived Architecture and Pipeline Assumptions
@@ -55,13 +55,16 @@
 
 ### 6. Decoder and Classifier Tensor Routing (`TD` and `LC`)
 - Stage 2 trains `TD` (Transformer encoder blocks over `x_pred` followed by linear projection and `PixelShuffle(patch_size)`) per channel to reconstruct the 4-channel crop.
-- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Pooled latents use the `theta` threshold and are recomputed each epoch because the crops are augmented anew (Section 8).
+- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Pooled latents use the `theta` threshold and are computed once, since `TE`, `SAE` and the crops are fixed.
 - Averaging over patches removes cell size from the pooled latents; `LC` does not read `area`.
 
 ### 7. Variable Crop Sizes
 - Crops of different sizes cannot be stacked into one tensor. Stages 1 and 2 group crops by side length and draw each batch from one group; Stage 3 computes latents group by group; `infer.py` processes one before/after pair at a time.
 - Failure mode: a side length with few crops yields small batches, so `BatchTopK` there behaves closer to per-crop TopK.
 
-### 8. Training Augmentation
-- `train.py` `augment_crop` runs on every crop loaded for training (Stages 1, 2 and 3); `infer.py` never augments. Stage 2 reconstructs the augmented crop. Stage 3 recomputes every crop's pooled latents each epoch, augmenting the before and after crop of a pair independently.
-- Steps, in order: rotation by 0/90/180/270° and a mirror flip half of the time (all channels); chromatic aberration, shifting R and B against G by up to `aug_ca_max_shift_px` pixels with edge pixels repeated; uneven illumination, multiplying R, G, B by a linear ramp in a random direction with slope up to `aug_illum_max_slope`; Gaussian blur on all channels with sigma up to `aug_blur_max_sigma`; Gaussian noise with standard deviation up to `aug_noise_max_std` on R, G, B, and on BODIPY only for after crops (before crops have no BODIPY image). Each strength is drawn uniformly from 0 to its maximum; the result is clipped to [0, 1].
+### 8. Augmentation (`segment.py`, before Cellpose)
+- Order per image: load, normalise brightfield, build the 4-channel stack, then segment the stack itself and, outside the test condition (`RD`), `aug_copies` augmented copies of it. Each copy is segmented by Cellpose on its own and its crops are saved under FOV `<fov>-aug<copy>` (e.g. `3-aug1`). `RD` images are never augmented, so `infer.py` sees original images only.
+- Steps, in order: rotation by 0/90/180/270° and a mirror flip half of the time (all channels); chromatic aberration, shifting R and B against G by up to `aug_ca_max_shift_px` pixels with edge pixels repeated; uneven illumination, multiplying R, G, B by a linear ramp across the image in a random direction with slope up to `aug_illum_max_slope`; Gaussian blur on all channels with sigma up to `aug_blur_max_sigma`; Gaussian noise with standard deviation up to `aug_noise_max_std` on R, G, B, and on BODIPY only for after images (before images have no BODIPY image). Each strength is drawn uniformly from 0 to its maximum; the result is clipped to [0, 1].
+- The before and after image of the same `(well, fov)` and copy draw from one generator seeded by `seed`, well, FOV and copy number, so both get the same rotation, flip and strengths. Their cells therefore still line up for centroid pairing, which only compares crops of the same `(well, fov)` and copy.
+- `train.py` uses augmented copies for training only: in validation wells only the original crops are kept. Training itself does no further augmentation.
+- Failure mode: augmentation is fixed when `segment.py` runs, so every epoch sees the same `1 + aug_copies` versions of each image; Cellpose runs `1 + aug_copies` times per non-test image.
