@@ -7,7 +7,7 @@ import torch.nn.functional as F
 # Model dimensions, paths, and training hyperparameters
 CFG = {
     "dinov3_repo_dir": None,    # str: path to local facebookresearch/dinov3 clone
-    "dinov3_weights": "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_weights": str(Path.home() / "Documents" / "models" / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
     "crop_dir": Path("data/crops"),
     "ckpt_out": Path("checkpoint.pt"),
     "device": "cuda" if torch.cuda.is_available() else "cpu",

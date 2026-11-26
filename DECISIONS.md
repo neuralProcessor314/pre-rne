@@ -36,14 +36,14 @@
 - Failure mode: saturated pixels break the multiplicative brightfield model; BODIPY 581/591 C11 shifts emission from red to green on oxidation, so one linear channel cannot carry the oxidised/reduced ratio.
 
 ### 3. Segmentation, Pairing, and Splits
-- `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), pads each mask's bounding box by `pad_px`, and cuts a square window from the 4-channel stack with no resizing: the side is the padded box's longer side rounded up to a multiple of the 16-pixel patch size, the window is centred on the box, and it is shifted back inside the image where it would stick out (such cells sit off-centre). Cells whose square would be larger than the image are skipped. Neighbouring cells inside the window are not masked out. After brightfield images without a matching BODIPY file are skipped.
+- `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), with the `cpsam` weights in Cellpose's default `<home>/.cellpose/models/`, pads each mask's bounding box by `pad_px`, and cuts a square window from the 4-channel stack with no resizing: the side is the padded box's longer side rounded up to a multiple of the 16-pixel patch size, the window is centred on the box, and it is shifted back inside the image where it would stick out (such cells sit off-centre). Cells whose square would be larger than the image are skipped. Neighbouring cells inside the window are not masked out. After brightfield images without a matching BODIPY file are skipped.
 - Failure mode: masks cut by the image border understate cell size; such cells are kept.
 - After cell groups pair with before cell groups of the same `(well, fov)` at the nearest mask centroid within `max_pair_dist_px`.
 - `RD` wells (before and after) are excluded from all training; control wells are split into train and validation per condition by `val_well_frac`.
 - Failure mode: stage drift or cell migration between before and after imaging breaks centroid correspondence; unmatched crops are skipped during Stage 3 training and omitted from paired inference.
 
 ### 4. DINOv3 Backbone (`TE`)
-- Meta `.pth` checkpoints store a raw `state_dict` without model definitions, so `TE` builds `dinov3_vitb16` from `dinov3_repo_dir` via `torch.hub.load(..., source="local")` before loading `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`.
+- Meta `.pth` checkpoints store a raw `state_dict` without model definitions, so `TE` builds `dinov3_vitb16` from `dinov3_repo_dir` via `torch.hub.load(..., source="local")` before loading `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth` from `<home>/Documents/models/` (`Path.home()`, so no username is hard-coded).
 - `TE` strips `[CLS]` and register tokens via `forward_features(flat)["x_norm_patchtokens"]` and remains frozen across all three training stages.
 
 ### 5. Inference Threshold Calibration (`SAE`)
