@@ -1,5 +1,7 @@
 from pathlib import Path
+import csv
 import math
+import shutil
 import zlib
 import numpy as np
 from PIL import Image
@@ -7,22 +9,27 @@ from scipy.ndimage import gaussian_filter
 import torch
 from cellpose import models
 
-# Paths, plate layout, intensity conversion, and segmentation hyperparameters
+from plate import CODES, COLUMNS, CONCENTRATIONS, well_number, well_position
+
+# Data steps, all under data_dir:
+#   0_<phase>_raw/<experiment folder>/<files>   raw microscope images (not changed)
+#   1_<phase>_rename/                           renamed copies: exp<n>_<phase>W<well>_<index>.<ext>
+#   2_<phase>_prepaug/                          normalised images and their augmented copies (PNG)
+#   3_<phase>_crops/                            one .pt file per cell
+# <phase> is "before" or "after". Running this script redoes all three steps; the 1_, 2_ and 3_ folders
+# are deleted and written again each time.
 CFG = {
-    "sep_dir": Path("data/sep"),
-    "crop_dir": Path("data/crops"),
-    "row_codes": None,          # list[str]: condition code of plate rows 1-4, e.g. ["RD", "DD", "RF", "DF"]
-    "fluo_weights": None,       # (wR, wG, wB): BODIPY channel = wR*R + wG*G + wB*B
-    "bf_mean": 0.5,             # float: mean of each brightfield channel after normalisation (0.5 = 128 of 255)
-    "bf_std": 0.25,             # float: standard deviation (contrast) of each brightfield channel after normalisation
-    "min_mask_pixels": None,    # int: minimum cell-group mask area
+    "data_dir": Path("data"),
+    "bf_mean": 0.5,             # float: mean of each R, G, B channel after normalisation (0.5 = 128 of 255)
+    "bf_std": 0.25,             # float: standard deviation (contrast) of each channel after normalisation
+    "min_mask_pixels": None,    # int: minimum cell mask area
     "pad_px": None,             # int: bounding-box padding in pixels
     "flow_threshold": None,     # float: Cellpose flow error threshold
     "cellprob_threshold": None, # float: Cellpose cell probability threshold
     "batch_size": None,         # int: Cellpose evaluation batch size
     "gpu": True,
     # Augmentation, applied to whole images after normalisation and before Cellpose.
-    # Each non-test image is also saved as aug_copies augmented copies; strengths are drawn from 0 up to these maxima.
+    # Each image is also saved as aug_copies augmented copies; strengths are drawn from 0 up to these maxima.
     "seed": 42,                     # int: seed for the augmentation draws
     "aug_copies": 3,                # int: augmented copies per image, besides the original
     "aug_ca_max_shift_px": 4,       # int: chromatic aberration, max shift of R and B against G, in pixels
@@ -31,114 +38,107 @@ CFG = {
     "aug_noise_max_std": 0.06,      # float: Gaussian noise, max standard deviation (intensities are 0-1)
 }
 
+PHASES = ["before", "after"]
 PATCH_SIZE = 16     # DINOv3 ViT-B/16 patch side; crop sides must be a multiple of it
 
-CODES = ["RD", "DD", "RF", "DF"]
-CONCENTRATIONS = ["0.1", "0.5"]     # 1.0 dropped: every cell was already dead
-
-# Plate columns from left to right: (side, concentration)
-# The 1.0 columns (wells 5, 6, 11, 12, 17, 18, 23, 24) stay in the list so well numbers keep their plate positions
-COLUMNS = [("L", "0.1"), ("R", "0.1"), ("L", "0.5"), ("R", "0.5"), ("L", "1.0"), ("R", "1.0")]
+# Magnifications kept. All kept images are 20x: exp3's files are labelled "40x" but were taken at 20x.
+# 4x and 10x images are dropped.
+KEEP_MAGNIFICATIONS = ["20x", "40x"]
 
 
-# Turn a well number 1-24 into a well name such as "RD_L0.1"
-# Wells are numbered along each row of 6, top row first
-def well_name_from_number(number):
-    row = (number - 1) // 6
-    column = (number - 1) % 6
-    code = CFG["row_codes"][row]
-    side, conc = COLUMNS[column]
-    return code + "_" + side + conc
+# ---------------- Step 1: rename ----------------
 
+# Read (well number, magnification) from a raw file name, or return None if the name does not fit.
+# Names in use:  exp1 "DD_0.1L_20x_39",  exp2 "bW13_20x_27",  exp3 "well13_40x_00"
+def parse_raw_name(stem):
+    parts = stem.split("_")
 
-# Read (phase, well name, FOV) from a file name, or return None if the name does not fit
-# Phase: b = before brightfield, a = after brightfield, f = after BODIPY
-# Examples: "bRD_L0.1_3" -> ("b", "RD_L0.1", "3"),  "aW7_3" -> ("a", name of well 7, "3")
-def parse_name(name):
-    phase = name[0]
-    parts = name[1:].split("_")
-    if phase not in ["b", "a", "f"]:
-        return None
-
-    # Well-number form: W<number>_<fov>
-    if len(parts) == 2 and parts[0].startswith("W"):
-        number_text = parts[0][1:]
-        fov = parts[1]
-        if CFG["row_codes"] is None:
-            return None
-        if not number_text.isdigit() or not fov.isdigit():
-            return None
-        number = int(number_text)
-        if number < 1 or number > 24:
-            return None
-        side, conc = COLUMNS[(number - 1) % 6]
-        if conc not in CONCENTRATIONS:
-            return None        # well of a dropped concentration
-        return phase, well_name_from_number(number), str(int(fov))
-
-    # Named form: <code>_<side><conc>_<fov>
-    if len(parts) == 3:
+    # <code>_<conc><side>_<magnification>_<number>
+    if len(parts) == 4:
         code = parts[0]
-        side = parts[1][0]
-        conc = parts[1][1:]
-        fov = parts[2]
-        if code not in CODES or side not in ["L", "R"] or conc not in CONCENTRATIONS:
+        conc = parts[1][:-1]
+        side = parts[1][-1]
+        magnification = parts[2]
+        if code not in CODES or (side, conc) not in COLUMNS:
             return None
-        if not fov.isdigit():
-            return None
-        return phase, code + "_" + side + conc, str(int(fov))   # int() drops leading zeros
+        return well_number(code, side, conc), magnification
+
+    # bW<well>_<magnification>_<number>  or  well<well>_<magnification>_<number>
+    if len(parts) == 3:
+        head = parts[0]
+        magnification = parts[1]
+        for prefix in ["bW", "well"]:
+            if head.startswith(prefix):
+                number_text = head[len(prefix):]
+                if number_text.isdigit() and 1 <= int(number_text) <= 24:
+                    return int(number_text), magnification
+        return None
 
     return None
 
 
-# Load the three grayscale PNGs of one RGB image as a (3, H, W) array scaled to [0, 1]
-def load_rgb(name):
-    channels = []
-    for i in range(3):
-        img = Image.open(CFG["sep_dir"] / f"{name}_c{i}.png")
-        if img.mode == "L":
-            max_value = 255.0       # 8-bit PNG
-        elif img.mode == "I;16" or img.mode == "I":
-            max_value = 65535.0     # 16-bit PNG
-        else:
-            raise ValueError(f"unexpected PNG mode {img.mode} in {name}_c{i}.png")
-        channels.append(np.array(img, dtype=np.float32) / max_value)
-    return np.stack(channels)
+# Copy every raw image to 1_<phase>_rename/ as exp<n>_<phase>W<well>_<index>.<ext>.
+# The index is one counter over all kept images (both phases), in alphabetical order of their raw paths.
+# Writes 1_rename_map.csv with each new name and its raw path.
+def rename_raw():
+    data = CFG["data_dir"]
+    entries = []
+    for phase in PHASES:
+        out_dir = data / f"1_{phase}_rename"
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
+        for path in (data / f"0_{phase}_raw").glob("*/*"):
+            if path.is_file():
+                entries.append((path.relative_to(data).as_posix(), phase, path))
+    entries.sort()
 
-
-# Load a BODIPY image as one channel: a fixed weighted sum of R, G, B
-def load_bodipy(name):
-    r, g, b = load_rgb(name)
-    w_r, w_g, w_b = CFG["fluo_weights"]
-    return w_r * r + w_g * g + w_b * b
-
-
-# Sort the separated images into before, after, and BODIPY tables keyed by (well, fov)
-def index_images():
-    before = {}
-    after = {}
-    bodipy = {}
-    tables = {"b": before, "a": after, "f": bodipy}
-
-    for c0_path in sorted(CFG["sep_dir"].glob("*_c0.png")):
-        name = c0_path.name[: -len("_c0.png")]
-        parsed = parse_name(name)
+    index = 0
+    rows = [["new_name", "raw_path"]]
+    for relative, phase, path in entries:
+        parsed = parse_raw_name(path.stem)
         if parsed is None:
-            print("skipped:", name)
+            print("name not understood, skipped:", relative)
             continue
-        phase, well, fov = parsed
-        table = tables[phase]
-        if (well, fov) in table:
-            raise ValueError(f"two images for {well} FOV {fov}: {table[(well, fov)]} and {name}")
-        table[(well, fov)] = name
+        number, magnification = parsed
+        if magnification not in KEEP_MAGNIFICATIONS:
+            print(f"{magnification} image dropped:", relative)
+            continue
+        experiment = path.parent.name.split("_")[0]          # "exp1_after_20261106" -> "exp1"
+        new_name = f"{experiment}_{phase}W{number}_{index:03d}{path.suffix.lower()}"
+        shutil.copy2(path, data / f"1_{phase}_rename" / new_name)
+        rows.append([new_name, relative])
+        index += 1
 
-    print(f"before={len(before)} after={len(after)} bodipy={len(bodipy)}")
-    return before, after, bodipy
+    with open(data / "1_rename_map.csv", "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+    print(f"renamed {index} images")
 
 
-# Normalise one brightfield image: each of R, G, B gets mean bf_mean and standard deviation bf_std,
+# ---------------- Step 2: normalise and augment ----------------
+
+# Read a renamed or derived file name, e.g. "exp1_afterW13_012-aug1" -> ("exp1", "after", 13, "012-aug1")
+def parse_image_name(stem):
+    experiment, phase_well, image = stem.split("_")
+    phase, number = phase_well.split("W")
+    return experiment, phase, int(number), image
+
+
+# Load an image as a float (3, H, W) array of R, G, B scaled to [0, 1]
+def load_rgb(path):
+    rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+    return rgb.transpose(2, 0, 1).copy()
+
+
+# Save a (3, H, W) array in [0, 1] as an 8-bit RGB PNG
+def save_rgb(rgb, path):
+    pixels = (np.clip(rgb, 0.0, 1.0).transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
+    Image.fromarray(pixels).save(path)
+
+
+# Normalise one image: each of R, G, B gets mean bf_mean and standard deviation bf_std,
 # so mean colour and contrast are the same in every image
-def normalise_brightfield(rgb):
+def normalise(rgb):
     for i in range(3):
         mean = rgb[i].mean()
         std = rgb[i].std()
@@ -148,23 +148,9 @@ def normalise_brightfield(rgb):
     return np.clip(rgb, 0.0, 1.0)
 
 
-# One BODIPY scale shared by all after images: the largest per-image 99.9th percentile
-def bodipy_scale(names):
-    scale = 0.0
-    for name in names:
-        scale = max(scale, float(np.percentile(load_bodipy(name), 99.9)))
-    if scale == 0.0:
-        scale = 1.0
-    return scale
-
-
-# ---------------- Augmentation (before Cellpose) ----------------
-
-# Random generator for one augmented copy of one field. The before and after image of the same
-# field and copy use the same generator, so they get the same rotation and the same strengths,
-# and their cells still line up for before/after pairing.
-def copy_generator(well, fov, copy):
-    key = f"{CFG['seed']}|{well}|{fov}|{copy}"
+# Random generator for one augmented copy of one image, fixed by seed, image name and copy number
+def copy_generator(name, copy):
+    key = f"{CFG['seed']}|{name}|{copy}"
     return np.random.default_rng(zlib.crc32(key.encode()))
 
 
@@ -178,10 +164,9 @@ def shift_channel(channel, dy, dx):
     return padded[m - dy:m - dy + h, m - dx:m - dx + w]
 
 
-# One augmented copy of a normalised image stack (4, H, W): channels 0-2 brightfield R, G, B, channel 3 BODIPY.
-# A before image has no BODIPY image (channel 3 is all zero), so that channel gets no noise.
-def augment_stack(stack, rng, is_before):
-    # Draw every random choice first, always in this order, so before and after images match
+# One augmented copy of a normalised (3, H, W) image
+def augment(rgb, rng):
+    # Every random choice, drawn first
     turns = int(rng.integers(0, 4))
     flip = rng.random() < 0.5
     m = CFG["aug_ca_max_shift_px"]
@@ -192,8 +177,8 @@ def augment_stack(stack, rng, is_before):
     sigma = rng.random() * CFG["aug_blur_max_sigma"]
     noise_std = rng.random() * CFG["aug_noise_max_std"]
 
-    # Rotation by 0, 90, 180 or 270 degrees, then a mirror flip (all channels; exact, no new pixels)
-    out = np.rot90(stack, turns, axes=(1, 2))
+    # Rotation by 0, 90, 180 or 270 degrees, then a mirror flip (exact, no new pixels)
+    out = np.rot90(rgb, turns, axes=(1, 2))
     if flip:
         out = out[:, :, ::-1]
     out = out.copy()
@@ -202,28 +187,50 @@ def augment_stack(stack, rng, is_before):
     out[0] = shift_channel(out[0], shift_r[0], shift_r[1])
     out[2] = shift_channel(out[2], shift_b[0], shift_b[1])
 
-    # Uneven illumination: brightfield multiplied by a brightness ramp in a random direction
+    # Uneven illumination: multiplied by a brightness ramp in a random direction
     height = out.shape[1]
     width = out.shape[2]
     ys = np.linspace(-1.0, 1.0, height)[:, None]
     xs = np.linspace(-1.0, 1.0, width)[None, :]
     ramp = 1.0 + slope * (xs * math.cos(angle) + ys * math.sin(angle))
-    out[0:3] = out[0:3] * ramp
+    out = out * ramp
 
-    # Out-of-focus blur on all channels
+    # Out-of-focus blur
     if sigma > 0:
-        for c in range(4):
+        for c in range(3):
             out[c] = gaussian_filter(out[c], sigma, mode="reflect", truncate=3.0)
 
     # Camera noise
-    out[0:3] = out[0:3] + rng.standard_normal(out[0:3].shape) * noise_std
-    if not is_before:
-        out[3] = out[3] + rng.standard_normal(out[3].shape) * noise_std
+    out = out + rng.standard_normal(out.shape) * noise_std
 
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
-# ---------------- Segmentation and crops ----------------
+# Normalise every renamed image of a kept concentration and save it to 2_<phase>_prepaug/
+# as <name>.png, plus aug_copies augmented copies <name>-aug<copy>.png
+def preprocess_and_augment():
+    data = CFG["data_dir"]
+    for phase in PHASES:
+        out_dir = data / f"2_{phase}_prepaug"
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
+
+        for path in sorted((data / f"1_{phase}_rename").glob("*")):
+            experiment, file_phase, number, image = parse_image_name(path.stem)
+            code, side, conc = well_position(number)
+            if conc not in CONCENTRATIONS:
+                continue                                  # well of a dropped concentration
+
+            rgb = normalise(load_rgb(path))
+            save_rgb(rgb, out_dir / f"{path.stem}.png")
+            for copy in range(1, CFG["aug_copies"] + 1):
+                augmented = augment(rgb, copy_generator(path.stem, copy))
+                save_rgb(augmented, out_dir / f"{path.stem}-aug{copy}.png")
+        print(f"{phase}: {len(list(out_dir.glob('*.png')))} images in {out_dir}")
+
+
+# ---------------- Step 3: segment and crop ----------------
 
 # Turn a padded bounding box into a square window of real image pixels (no resizing)
 # The side is the box's longer side rounded up to a multiple of PATCH_SIZE; the window is
@@ -249,18 +256,17 @@ def square_window(y0, y1, x0, x1, height, width):
     return top, top + side, left, left + side
 
 
-# Segment cells on the 3 brightfield channels and save each cell group as a square 4-channel crop
-def segment_and_save(model, stack, out_dir, well, fov):
+# Segment cells in one (3, H, W) image and save each cell as a square crop <name>_cell<id>.pt
+def segment_and_save(model, rgb, out_dir, name):
     masks, flows, styles = model.eval(
-        stack[:3],
+        rgb,
         channel_axis=0,
         batch_size=CFG["batch_size"],
         flow_threshold=CFG["flow_threshold"],
         cellprob_threshold=CFG["cellprob_threshold"],
     )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    height = stack.shape[1]
-    width = stack.shape[2]
+    height = rgb.shape[1]
+    width = rgb.shape[2]
 
     for cell_id in range(1, int(masks.max()) + 1):
         ys, xs = np.where(masks == cell_id)
@@ -274,68 +280,33 @@ def segment_and_save(model, stack, out_dir, well, fov):
         x1 = int(xs.max()) + 1 + CFG["pad_px"]
         window = square_window(y0, y1, x0, x1, height, width)
         if window is None:
-            print(f"cell larger than the image, skipped: {well} FOV {fov} cell {cell_id}")
+            print(f"cell larger than the image, skipped: {name} cell {cell_id}")
             continue
         top, bottom, left, right = window
 
         # copy() so the saved file holds only the crop, not the whole image behind it
-        crop = torch.from_numpy(stack[:, top:bottom, left:right].copy())   # (4, side, side)
+        crop = torch.from_numpy(rgb[:, top:bottom, left:right].copy())   # (3, side, side)
 
         centroid = torch.tensor([float(ys.mean()), float(xs.mean())])
-        area = torch.tensor(len(ys))                                          # mask pixel count
-        out_path = out_dir / f"{well}_{fov}_cell{cell_id:04d}.pt"
-        torch.save({"image": crop, "centroid": centroid, "area": area}, out_path)
+        area = torch.tensor(len(ys))                                        # mask pixel count
+        torch.save({"image": crop, "centroid": centroid, "area": area}, out_dir / f"{name}_cell{cell_id:04d}.pt")
 
 
-# Segment an image and save its crops, then do the same for aug_copies augmented copies,
-# saved as FOV "<fov>-aug<copy>" (e.g. "3-aug1"). Every condition is augmented, because every
-# well is a training well in three of the four leave-one-well-out folds; train.py drops the
-# copies of the held-out wells.
-def segment_with_copies(model, stack, out_dir, well, fov, is_before):
-    segment_and_save(model, stack, out_dir, well, fov)
-    for copy in range(1, CFG["aug_copies"] + 1):
-        augmented = augment_stack(stack, copy_generator(well, fov, copy), is_before)
-        segment_and_save(model, augmented, out_dir, well, f"{fov}-aug{copy}")
-
-
-# Build 4-channel images (brightfield R, G, B + BODIPY) and save cell crops for every FOV
+# Run Cellpose on every image in 2_<phase>_prepaug/ and save per-cell crops to 3_<phase>_crops/
 def segment_all():
-    before, after, bodipy = index_images()
+    data = CFG["data_dir"]
     model = models.CellposeModel(gpu=CFG["gpu"], pretrained_model="cpsam")
-
-    # Before images: brightfield and an empty BODIPY channel (dye not added yet)
-    if len(before) > 0:
-        for (well, fov), name in sorted(before.items()):
-            rgb = normalise_brightfield(load_rgb(name))
-            empty = np.zeros_like(rgb[0])
-            stack = np.stack([rgb[0], rgb[1], rgb[2], empty])
-            code = well.split("_")[0]
-            segment_with_copies(model, stack, CFG["crop_dir"] / "before" / code, well, fov, is_before=True)
-
-    # After images: brightfield and the BODIPY image of the same well and FOV
-    pairs = []
-    for (well, fov), name in sorted(after.items()):
-        if (well, fov) in bodipy:
-            pairs.append((well, fov, name, bodipy[(well, fov)]))
-        else:
-            print("after image without BODIPY, skipped:", name)
-
-    if len(pairs) > 0:
-        bodipy_names = []
-        for well, fov, name, fluo_name in pairs:
-            bodipy_names.append(fluo_name)
-        scale = bodipy_scale(bodipy_names)
-
-        for well, fov, name, fluo_name in pairs:
-            rgb = normalise_brightfield(load_rgb(name))
-            fluo = np.clip(load_bodipy(fluo_name) / scale, 0.0, 1.0)
-            if fluo.shape != rgb[0].shape:
-                raise ValueError(f"brightfield and BODIPY sizes differ for {well} FOV {fov}")
-            stack = np.stack([rgb[0], rgb[1], rgb[2], fluo])
-
-            code = well.split("_")[0]
-            segment_with_copies(model, stack, CFG["crop_dir"] / "after" / code, well, fov, is_before=False)
+    for phase in PHASES:
+        out_dir = data / f"3_{phase}_crops"
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
+        for path in sorted((data / f"2_{phase}_prepaug").glob("*.png")):
+            segment_and_save(model, load_rgb(path), out_dir, path.stem)
+        print(f"{phase}: {len(list(out_dir.glob('*.pt')))} cell crops in {out_dir}")
 
 
 if __name__ == "__main__":
+    rename_raw()
+    preprocess_and_augment()
     segment_all()

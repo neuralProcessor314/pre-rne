@@ -4,15 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from plate import well_position
+
 # Model dimensions, paths, and training hyperparameters
 CFG = {
     "dinov3_repo_dir": None,    # str: path to local facebookresearch/dinov3 clone
     "dinov3_weights": str(Path.home() / "Documents" / "models" / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
-    "crop_dir": Path("data/crops"),
+    "data_dir": Path("data"),          # crops are read from data/3_before_crops and data/3_after_crops
     "ckpt_dir": Path("checkpoints"),    # one checkpoint per fold: fold1.pt ... fold4.pt
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "seed": None,               # int: RNG seed
-    "max_pair_dist_px": None,   # float: max centroid distance for before/after pairing
     # Stage 1: SAE
     "d_sae": None,              # int: SAE latent dictionary size
     "topk": None,               # int: average active latents per token (BatchTopK)
@@ -37,111 +38,74 @@ CFG = {
     "lc_weight_decay": None,    # float
 }
 
-# Condition codes: DD = DMSO + DMSO, DF = DMSO + ferrostatin, RF = RSL3 + ferrostatin, RD = RSL3 + DMSO
-# RD is the only ferroptotic condition: LC predicts ferroptotic (1, RD) or not ferroptotic (0, DD, DF, RF)
+# RD (RSL3 + DMSO) is the only ferroptotic condition: LC predicts ferroptotic (1, RD) or
+# not ferroptotic (0, DD, DF, RF)
 FERROPTOTIC_CODE = "RD"
 CLASSES = ["not ferroptotic", "ferroptotic"]
+CHANNELS = 3        # R, G, B, each tokenised by TE as its own grayscale image
 
 # Leave-one-well-out folds: fold k holds out the wells in plate column FOLD_COLUMNS[k] of every
-# condition (one well per condition) and trains on the wells of the other three columns
+# condition (one well per condition, in every experiment) and trains on the other three columns
 FOLD_COLUMNS = ["L0.1", "R0.1", "L0.5", "R0.5"]
 
 
 # ---------------- Data ----------------
 
-# Split a crop file name such as "DD_L0.5_12_cell0003" into well "DD_L0.5" and FOV "12"
-def parse_well_fov(stem):
-    code, side_conc, fov, cell = stem.split("_")
-    return code + "_" + side_conc, fov
+# Read a crop file name such as "exp1_afterW13_012-aug1_cell0003"
+def parse_crop_name(stem):
+    experiment, phase_well, image, cell = stem.split("_")
+    phase, number = phase_well.split("W")
+    return experiment, phase, int(number), image
 
 
 # Label of a condition: 1 = ferroptotic (RD), 0 = not ferroptotic
-def label_of(cond):
-    if cond == FERROPTOTIC_CODE:
+def label_of(code):
+    if code == FERROPTOTIC_CODE:
         return 1
     return 0
 
 
-# True if the well is held out in this fold, e.g. "DD_L0.1" in fold 0
-def is_held_out(well, fold):
-    return well.split("_")[1] == FOLD_COLUMNS[fold]
-
-
-# List every crop with its group (before/after), condition, well, and FOV
-def list_crops(crop_dir):
+# Every crop in 3_before_crops and 3_after_crops, with its experiment, phase, well, condition and plate column
+def list_crops(data_dir):
     crops = []
-    for path in sorted(crop_dir.glob("*/*/*.pt")):
-        group = path.parent.parent.name
-        cond = path.parent.name
-        well, fov = parse_well_fov(path.stem)
-        augmented = "-aug" in fov          # augmented copy made by segment.py, e.g. FOV "3-aug1"
-        crops.append({"path": path, "group": group, "cond": cond, "well": well, "fov": fov, "augmented": augmented})
+    for phase in ["before", "after"]:
+        for path in sorted((data_dir / f"3_{phase}_crops").glob("*.pt")):
+            experiment, file_phase, number, image = parse_crop_name(path.stem)
+            code, side, conc = well_position(number)
+            crops.append({
+                "path": path,
+                "experiment": experiment,
+                "phase": phase,
+                "well": experiment + "_" + code + "_" + side + conc,    # e.g. "exp1_DD_L0.1"
+                "code": code,
+                "column": side + conc,                                    # e.g. "L0.1"
+                "augmented": "-aug" in image,                             # augmented copy made by segment.py
+            })
     return crops
-
-
-# Group before crops by (well, fov), storing each crop's path and centroid
-def index_before(before_paths):
-    index = {}
-    for path in before_paths:
-        well, fov = parse_well_fov(path.stem)
-        centroid = torch.load(path, weights_only=True)["centroid"]
-        if (well, fov) not in index:
-            index[(well, fov)] = []
-        index[(well, fov)].append((path, centroid))
-    return index
-
-
-# Return the before crop with the nearest centroid, or None if none is within max_dist
-def find_nearest_before(after_path, candidates, max_dist):
-    after_centroid = torch.load(after_path, weights_only=True)["centroid"]
-    best_path = None
-    best_dist = None
-    for before_path, before_centroid in candidates:
-        dist = torch.norm(after_centroid - before_centroid).item()
-        if best_dist is None or dist < best_dist:
-            best_path = before_path
-            best_dist = dist
-    if best_dist is None or best_dist > max_dist:
-        return None
-    return best_path
-
-
-# Pair each after crop with the nearest before crop of the same well and FOV: [(before, after, label)]
-def make_pairs(after_crops, before_index, max_dist):
-    pairs = []
-    for crop in after_crops:
-        candidates = before_index.get((crop["well"], crop["fov"]), [])
-        before_path = find_nearest_before(crop["path"], candidates, max_dist)
-        if before_path is not None:
-            pairs.append((before_path, crop["path"], label_of(crop["cond"])))
-    return pairs
 
 
 # Crops of one fold. Training: every crop of the other three columns' wells, augmented copies included.
 # Held out: one well per condition, original images only (its augmented copies are not used).
-# Returns training crops (Stages 1-2), training pairs (Stage 3), held-out pairs (infer.py).
-def build_fold(crop_dir, fold, max_dist):
+# Before and after images are not paired yet, so LC works on single after cells.
+# Returns training crops of both phases (Stages 1-2), training after cells and held-out after cells,
+# each a list of (path, label).
+def build_fold(data_dir, fold):
     train_singles = []
-    before_paths = []
-    train_after = []
-    heldout_after = []
-    for crop in list_crops(crop_dir):
-        held_out = is_held_out(crop["well"], fold)
+    train_cells = []
+    heldout_cells = []
+    for crop in list_crops(data_dir):
+        held_out = crop["column"] == FOLD_COLUMNS[fold]
         if held_out and crop["augmented"]:
             continue
-        if crop["group"] == "before":
-            before_paths.append(crop["path"])
         if not held_out:
             train_singles.append(crop["path"])
-            if crop["group"] == "after":
-                train_after.append(crop)
-        elif crop["group"] == "after":
-            heldout_after.append(crop)
-
-    before_index = index_before(before_paths)
-    train_pairs = make_pairs(train_after, before_index, max_dist)
-    heldout_pairs = make_pairs(heldout_after, before_index, max_dist)
-    return train_singles, train_pairs, heldout_pairs
+        if crop["phase"] == "after":
+            cell = (crop["path"], label_of(crop["code"]))
+            if held_out:
+                heldout_cells.append(cell)
+            else:
+                train_cells.append(cell)
+    return train_singles, train_cells, heldout_cells
 
 
 # Crops are not resized, so their sizes differ, and crops of different sizes cannot share a batch.
@@ -195,16 +159,16 @@ def load_frozen_dinov3_single_channel(repo_dir, weights_path, device):
     return te.to(device)
 
 
-# Encode each of the 4 channels as its own grayscale image
-# imgs (B, 4, H, W) -> tokens (B, 4, T, D), where T = hp * wp patches
-def encode_four_channels(te, imgs):
+# Encode each channel as its own grayscale image
+# imgs (B, C, H, W) -> tokens (B, C, T, D), where T = hp * wp patches
+def encode_channels(te, imgs):
     b, c, h, w = imgs.shape
     patch = te.patch_embed.patch_size[0]
     hp = h // patch
     wp = w // patch
     with torch.no_grad():
         flat = imgs.reshape(b * c, 1, h, w)
-        tokens = te.forward_features(flat)["x_norm_patchtokens"]    # (B*4, T, D)
+        tokens = te.forward_features(flat)["x_norm_patchtokens"]    # (B*C, T, D)
     tokens = tokens.reshape(b, c, hp * wp, te.embed_dim)
     return tokens, hp, wp
 
@@ -345,7 +309,7 @@ def train_sae(te, image_paths, device):
     for epoch in range(CFG["sae_epochs"]):
         for batch_paths in make_batches(groups, CFG["sae_batch_size"], rng):
             imgs = load_images(batch_paths)
-            tokens, hp, wp = encode_four_channels(te, imgs.to(device))
+            tokens, hp, wp = encode_channels(te, imgs.to(device))
             tokens = tokens.reshape(-1, d_in)       # all patch tokens of all channels
             recon_loss, aux_loss = sae.training_losses(tokens)
             loss = recon_loss + CFG["aux_weight"] * aux_loss
@@ -378,7 +342,7 @@ def train_td(te, sae, image_paths, device):
         for batch_paths in make_batches(groups, CFG["td_batch_size"], rng):
             imgs = load_images(batch_paths).to(device)
             with torch.no_grad():
-                tokens, hp, wp = encode_four_channels(te, imgs)
+                tokens, hp, wp = encode_channels(te, imgs)
                 b, c, t, d = tokens.shape
                 z = sae.encode_batch_topk(tokens.reshape(-1, d))
                 x_pred = sae.decode(z).reshape(b, c, t, d)
@@ -393,9 +357,9 @@ def train_td(te, sae, image_paths, device):
     return td
 
 
-# Patch-averaged SAE latents of each crop: {path: Tensor[4 * d_sae]}
+# Patch-averaged SAE latents of each crop: {path: Tensor[CHANNELS * d_sae]}
 # Uses the inference threshold (as infer.py does), so a crop's latents do not depend on
-# which other crops share its batch. Before and after crops of one cell usually differ in size.
+# which other crops share its batch.
 def pooled_latents(te, sae, groups, batch_size, device):
     latents = {}
     with torch.no_grad():
@@ -404,7 +368,7 @@ def pooled_latents(te, sae, groups, batch_size, device):
             for start in range(0, len(group), batch_size):
                 batch_paths = group[start:start + batch_size]
                 imgs = load_images(batch_paths).to(device)
-                tokens, hp, wp = encode_four_channels(te, imgs)
+                tokens, hp, wp = encode_channels(te, imgs)
                 b, c, t, d = tokens.shape
                 z = sae.encode_threshold(tokens.reshape(-1, d))
                 pooled = pool_over_patches(z, b, c, t)
@@ -413,41 +377,35 @@ def pooled_latents(te, sae, groups, batch_size, device):
     return latents
 
 
-# Stage 3: train LC (ferroptotic or not) on the before -> after change of patch-averaged SAE latents (TE and SAE frozen)
-def train_lc(te, sae, pairs, device):
-    crop_paths = []
-    seen = set()
-    for before_path, after_path, label in pairs:
-        for path in [before_path, after_path]:
-            if path not in seen:
-                seen.add(path)
-                crop_paths.append(path)
-    groups = group_by_side(crop_paths)
-
+# Stage 3: train LC (ferroptotic or not) on the patch-averaged SAE latents of single after cells
+# (TE and SAE frozen)
+def train_lc(te, sae, cells, device):
+    paths = []
     labels = []
-    for before_path, after_path, label in pairs:
+    for path, label in cells:
+        paths.append(path)
         labels.append(label)
     labels = torch.tensor(labels, device=device)
 
-    # One RD condition against three others: weight each class by 1 / its share of the pairs,
+    # One RD condition against three others: weight each class by 1 / its share of the cells,
     # so both classes count equally in the loss
     class_weights = []
     for c in range(len(CLASSES)):
         count = int((labels == c).sum())
         if count == 0:
-            raise ValueError(f"no training pairs of class '{CLASSES[c]}'")
+            raise ValueError(f"no training cells of class '{CLASSES[c]}'")
         class_weights.append(len(labels) / (len(CLASSES) * count))
     class_weights = torch.tensor(class_weights, device=device)
 
-    lc = nn.Linear(4 * CFG["d_sae"], len(CLASSES)).to(device)
+    lc = nn.Linear(CHANNELS * CFG["d_sae"], len(CLASSES)).to(device)
     optimizer = torch.optim.AdamW(lc.parameters(), lr=CFG["lc_lr"], weight_decay=CFG["lc_weight_decay"])
 
     # TE and SAE are frozen and crops are fixed, so every crop's latents are computed once
-    latents = pooled_latents(te, sae, groups, CFG["lc_batch_size"], device)
+    latents = pooled_latents(te, sae, group_by_side(paths), CFG["lc_batch_size"], device)
     features = []
-    for before_path, after_path, label in pairs:
-        features.append(latents[after_path] - latents[before_path])
-    features = torch.stack(features)                          # (N, 4 * d_sae)
+    for path in paths:
+        features.append(latents[path])
+    features = torch.stack(features)                          # (N, CHANNELS * d_sae)
 
     lc.train()
     for epoch in range(CFG["lc_epochs"]):
@@ -472,14 +430,14 @@ def train():
 
     for fold in range(len(FOLD_COLUMNS)):
         torch.manual_seed(CFG["seed"])
-        train_singles, train_pairs, heldout_pairs = build_fold(CFG["crop_dir"], fold, CFG["max_pair_dist_px"])
+        train_singles, train_cells, heldout_cells = build_fold(CFG["data_dir"], fold)
         print(f"fold {fold + 1}: held-out column {FOLD_COLUMNS[fold]}, "
-              f"{len(train_singles)} training crops, {len(train_pairs)} training pairs, "
-              f"{len(heldout_pairs)} held-out pairs")
+              f"{len(train_singles)} training crops, {len(train_cells)} training after cells, "
+              f"{len(heldout_cells)} held-out after cells")
 
         sae = train_sae(te, train_singles, device)
         td = train_td(te, sae, train_singles, device)
-        lc = train_lc(te, sae, train_pairs, device)
+        lc = train_lc(te, sae, train_cells, device)
 
         torch.save(
             {

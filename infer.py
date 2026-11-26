@@ -4,24 +4,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from train import (
+    CHANNELS,
     CLASSES,
     FOLD_COLUMNS,
     BatchTopKSAE,
     TransformerDecoder,
     build_fold,
-    encode_four_channels,
+    encode_channels,
     load_frozen_dinov3_single_channel,
     load_images,
-    parse_well_fov,
+    parse_crop_name,
     pool_over_patches,
 )
+from plate import well_name
 
 # Inference paths and optional latent-intervention settings
 INFER_CFG = {
     "ckpt_dir": Path("checkpoints"),         # fold1.pt ... fold4.pt from train.py
-    "crop_dir": Path("data/crops"),
+    "data_dir": Path("data"),
     "out_path": Path("heldout_results.pt"),
-    "intervene_channel": None,       # int or None: channel 0..3 to edit before TD
+    "intervene_channel": None,       # int or None: channel 0..2 (R, G, B) to edit before TD
     "intervene_latent": None,        # int or None: latent 0..d_sae-1 to edit before TD
     "intervene_scale": None,         # float or None: multiplier (e.g. 0.0 to remove the latent)
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -53,15 +55,15 @@ def load_fold_models(ckpt, te, device):
     td.load_state_dict(ckpt["td"])
     td.eval()
 
-    lc = nn.Linear(4 * cfg["d_sae"], len(ckpt["classes"])).to(device)
+    lc = nn.Linear(CHANNELS * cfg["d_sae"], len(CLASSES)).to(device)
     lc.load_state_dict(ckpt["lc"])
     lc.eval()
 
     return sae, td, lc
 
 
-# Leave-one-well-out: run each fold's models on that fold's held-out wells, and export
-# predictions, true labels, latents, and TD reconstructions for every held-out pair
+# Leave-one-well-out: run each fold's models on that fold's held-out after cells, and export
+# predictions, true labels, pooled latents, and TD reconstructions for every held-out cell
 def run_inference():
     device = INFER_CFG["device"]
     first = torch.load(INFER_CFG["ckpt_dir"] / "fold1.pt", map_location=device, weights_only=False)
@@ -72,58 +74,49 @@ def run_inference():
     scale = INFER_CFG["intervene_scale"]
     do_intervene = channel is not None and latent is not None and scale is not None
 
-    # One pair at a time: crops are not resized, so before and after crops differ in size
+    # One cell at a time: crops are not resized, so their sizes differ
     results = []
     with torch.no_grad():
         for fold in range(len(FOLD_COLUMNS)):
             ckpt = torch.load(INFER_CFG["ckpt_dir"] / f"fold{fold + 1}.pt", map_location=device, weights_only=False)
             sae, td, lc = load_fold_models(ckpt, te, device)
             d_sae = ckpt["cfg"]["d_sae"]
-            train_singles, train_pairs, heldout_pairs = build_fold(
-                INFER_CFG["crop_dir"], fold, ckpt["cfg"]["max_pair_dist_px"]
-            )
+            train_singles, train_cells, heldout_cells = build_fold(INFER_CFG["data_dir"], fold)
 
-            for before_path, after_path, label in heldout_pairs:
-                before = load_images([before_path]).to(device)     # (1, 4, side, side)
-                after = load_images([after_path]).to(device)
+            for path, label in heldout_cells:
+                image = load_images([path]).to(device)              # (1, C, side, side)
 
                 # Sparse latents with the threshold instead of BatchTopK
-                tok_before, hp_before, wp_before = encode_four_channels(te, before)
-                tok_after, hp, wp = encode_four_channels(te, after)
-                b, c, t_before, d = tok_before.shape
-                b, c, t, d = tok_after.shape
-                z_before_tokens = sae.encode_threshold(tok_before.reshape(-1, d))
-                z_after_tokens = sae.encode_threshold(tok_after.reshape(-1, d))
+                tokens, hp, wp = encode_channels(te, image)
+                b, c, t, d = tokens.shape
+                z_tokens = sae.encode_threshold(tokens.reshape(-1, d))
 
-                # Classify the before -> after change
-                z_before = pool_over_patches(z_before_tokens, b, c, t_before)
-                z_after = pool_over_patches(z_after_tokens, b, c, t)
-                z_delta = z_after - z_before
-                logits = lc(z_delta)
+                # Classify the cell
+                z = pool_over_patches(z_tokens, b, c, t)
+                logits = lc(z)
                 probs = F.softmax(logits, dim=1)
 
-                # Reconstruct the after image from its latents
-                x_pred = sae.decode(z_after_tokens).reshape(b, c, t, d)
+                # Reconstruct the crop from its latents
+                x_pred = sae.decode(z_tokens).reshape(b, c, t, d)
                 img_recon = td(x_pred, hp, wp)
 
                 # Optionally scale one latent in one channel and reconstruct again
                 img_intervened = None
                 if do_intervene:
-                    z_edit = z_after_tokens.reshape(b, c, t, d_sae).clone()
+                    z_edit = z_tokens.reshape(b, c, t, d_sae).clone()
                     z_edit[:, channel, :, latent] = z_edit[:, channel, :, latent] * scale
                     x_edit = sae.decode(z_edit.reshape(-1, d_sae)).reshape(b, c, t, d)
                     img_intervened = td(x_edit, hp, wp)
 
+                experiment, phase, number, image_name = parse_crop_name(path.stem)
                 entry = {
-                    "path": str(after_path),
+                    "path": str(path),
                     "fold": fold + 1,
-                    "well": parse_well_fov(after_path.stem)[0],
-                    "label": label,                         # true class: 1 ferroptotic (RD), 0 not
+                    "well": experiment + "_" + well_name(number),    # e.g. "exp1_DD_L0.1"
+                    "label": label,                                   # true class: 1 ferroptotic (RD), 0 not
                     "logits": logits[0].cpu(),
                     "probs": probs[0].cpu(),
-                    "z_before": z_before[0].cpu(),
-                    "z_after": z_after[0].cpu(),
-                    "z_delta": z_delta[0].cpu(),
+                    "z": z[0].cpu(),
                     "img_recon": img_recon[0].cpu(),
                 }
                 if img_intervened is not None:
