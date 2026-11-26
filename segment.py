@@ -7,8 +7,6 @@ from scipy.ndimage import gaussian_filter
 import torch
 from cellpose import models
 
-from train import TEST_CODE
-
 # Paths, plate layout, intensity conversion, and segmentation hyperparameters
 CFG = {
     "sep_dir": Path("data/sep"),
@@ -289,13 +287,12 @@ def segment_and_save(model, stack, out_dir, well, fov):
         torch.save({"image": crop, "centroid": centroid, "area": area}, out_path)
 
 
-# Segment an image and save its crops; outside the test condition, do the same for aug_copies
-# augmented copies, saved as FOV "<fov>-aug<copy>" (e.g. "3-aug1")
+# Segment an image and save its crops, then do the same for aug_copies augmented copies,
+# saved as FOV "<fov>-aug<copy>" (e.g. "3-aug1"). Every condition is augmented, because every
+# well is a training well in three of the four leave-one-well-out folds; train.py drops the
+# copies of the held-out wells.
 def segment_with_copies(model, stack, out_dir, well, fov, is_before):
     segment_and_save(model, stack, out_dir, well, fov)
-    code = well.split("_")[0]
-    if code == TEST_CODE:
-        return
     for copy in range(1, CFG["aug_copies"] + 1):
         augmented = augment_stack(stack, copy_generator(well, fov, copy), is_before)
         segment_and_save(model, augmented, out_dir, well, f"{fov}-aug{copy}")
@@ -337,11 +334,7 @@ def segment_all():
             stack = np.stack([rgb[0], rgb[1], rgb[2], fluo])
 
             code = well.split("_")[0]
-            if code == TEST_CODE:
-                group = "test"
-            else:
-                group = "control"
-            segment_with_copies(model, stack, CFG["crop_dir"] / group / code, well, fov, is_before=False)
+            segment_with_copies(model, stack, CFG["crop_dir"] / "after" / code, well, fov, is_before=False)
 
 
 if __name__ == "__main__":

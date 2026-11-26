@@ -9,9 +9,8 @@ CFG = {
     "dinov3_repo_dir": None,    # str: path to local facebookresearch/dinov3 clone
     "dinov3_weights": str(Path.home() / "Documents" / "models" / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"),
     "crop_dir": Path("data/crops"),
-    "ckpt_out": Path("checkpoint.pt"),
+    "ckpt_dir": Path("checkpoints"),    # one checkpoint per fold: fold1.pt ... fold4.pt
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "val_well_frac": None,      # float: fraction of wells per control condition for val
     "seed": None,               # int: RNG seed
     "max_pair_dist_px": None,   # float: max centroid distance for before/after pairing
     # Stage 1: SAE
@@ -39,8 +38,13 @@ CFG = {
 }
 
 # Condition codes: DD = DMSO + DMSO, DF = DMSO + ferrostatin, RF = RSL3 + ferrostatin, RD = RSL3 + DMSO
-CONTROL_CLASSES = ["DD", "DF", "RF"]
-TEST_CODE = "RD"
+# RD is the only ferroptotic condition: LC predicts ferroptotic (1, RD) or not ferroptotic (0, DD, DF, RF)
+FERROPTOTIC_CODE = "RD"
+CLASSES = ["not ferroptotic", "ferroptotic"]
+
+# Leave-one-well-out folds: fold k holds out the wells in plate column FOLD_COLUMNS[k] of every
+# condition (one well per condition) and trains on the wells of the other three columns
+FOLD_COLUMNS = ["L0.1", "R0.1", "L0.5", "R0.5"]
 
 
 # ---------------- Data ----------------
@@ -51,34 +55,28 @@ def parse_well_fov(stem):
     return code + "_" + side_conc, fov
 
 
-# List every crop except the test condition, with its group (before/control), condition, well, and FOV
+# Label of a condition: 1 = ferroptotic (RD), 0 = not ferroptotic
+def label_of(cond):
+    if cond == FERROPTOTIC_CODE:
+        return 1
+    return 0
+
+
+# True if the well is held out in this fold, e.g. "DD_L0.1" in fold 0
+def is_held_out(well, fold):
+    return well.split("_")[1] == FOLD_COLUMNS[fold]
+
+
+# List every crop with its group (before/after), condition, well, and FOV
 def list_crops(crop_dir):
     crops = []
     for path in sorted(crop_dir.glob("*/*/*.pt")):
         group = path.parent.parent.name
         cond = path.parent.name
-        if cond == TEST_CODE:
-            continue
         well, fov = parse_well_fov(path.stem)
         augmented = "-aug" in fov          # augmented copy made by segment.py, e.g. FOV "3-aug1"
         crops.append({"path": path, "group": group, "cond": cond, "well": well, "fov": fov, "augmented": augmented})
     return crops
-
-
-# Pick validation wells separately for each control condition
-def choose_val_wells(crops):
-    rng = random.Random(CFG["seed"])
-    val_wells = []
-    for cond in CONTROL_CLASSES:
-        wells = []
-        for crop in crops:
-            if crop["cond"] == cond and crop["well"] not in wells:
-                wells.append(crop["well"])
-        wells.sort()
-        rng.shuffle(wells)
-        n_val = max(1, int(len(wells) * CFG["val_well_frac"]))
-        val_wells.extend(wells[:n_val])
-    return val_wells
 
 
 # Group before crops by (well, fov), storing each crop's path and centroid
@@ -108,45 +106,42 @@ def find_nearest_before(after_path, candidates, max_dist):
     return best_path
 
 
-# Split crops into train/val by well, and pair each control after-crop with its before-crop.
-# Augmented copies go to training only; validation uses the original images.
-def build_splits(crop_dir):
-    crops = list_crops(crop_dir)
-    val_wells = choose_val_wells(crops)
+# Pair each after crop with the nearest before crop of the same well and FOV: [(before, after, label)]
+def make_pairs(after_crops, before_index, max_dist):
+    pairs = []
+    for crop in after_crops:
+        candidates = before_index.get((crop["well"], crop["fov"]), [])
+        before_path = find_nearest_before(crop["path"], candidates, max_dist)
+        if before_path is not None:
+            pairs.append((before_path, crop["path"], label_of(crop["cond"])))
+    return pairs
 
-    # Single crops for Stages 1-2
+
+# Crops of one fold. Training: every crop of the other three columns' wells, augmented copies included.
+# Held out: one well per condition, original images only (its augmented copies are not used).
+# Returns training crops (Stages 1-2), training pairs (Stage 3), held-out pairs (infer.py).
+def build_fold(crop_dir, fold, max_dist):
     train_singles = []
-    val_singles = []
     before_paths = []
-    for crop in crops:
-        if crop["well"] in val_wells:
-            if not crop["augmented"]:
-                val_singles.append(crop["path"])
-        else:
-            train_singles.append(crop["path"])
+    train_after = []
+    heldout_after = []
+    for crop in list_crops(crop_dir):
+        held_out = is_held_out(crop["well"], fold)
+        if held_out and crop["augmented"]:
+            continue
         if crop["group"] == "before":
             before_paths.append(crop["path"])
+        if not held_out:
+            train_singles.append(crop["path"])
+            if crop["group"] == "after":
+                train_after.append(crop)
+        elif crop["group"] == "after":
+            heldout_after.append(crop)
 
-    # (before, after, label) pairs for Stage 3
     before_index = index_before(before_paths)
-    train_pairs = []
-    val_pairs = []
-    for crop in crops:
-        if crop["group"] != "control":
-            continue
-        candidates = before_index.get((crop["well"], crop["fov"]), [])
-        before_path = find_nearest_before(crop["path"], candidates, CFG["max_pair_dist_px"])
-        if before_path is None:
-            continue
-        label = CONTROL_CLASSES.index(crop["cond"])
-        pair = (before_path, crop["path"], label)
-        if crop["well"] in val_wells:
-            if not crop["augmented"]:
-                val_pairs.append(pair)
-        else:
-            train_pairs.append(pair)
-
-    return train_singles, val_singles, train_pairs, val_pairs
+    train_pairs = make_pairs(train_after, before_index, max_dist)
+    heldout_pairs = make_pairs(heldout_after, before_index, max_dist)
+    return train_singles, train_pairs, heldout_pairs
 
 
 # Crops are not resized, so their sizes differ, and crops of different sizes cannot share a batch.
@@ -418,7 +413,7 @@ def pooled_latents(te, sae, groups, batch_size, device):
     return latents
 
 
-# Stage 3: train LC on the before -> after change of patch-averaged SAE latents (TE and SAE frozen)
+# Stage 3: train LC (ferroptotic or not) on the before -> after change of patch-averaged SAE latents (TE and SAE frozen)
 def train_lc(te, sae, pairs, device):
     crop_paths = []
     seen = set()
@@ -434,7 +429,17 @@ def train_lc(te, sae, pairs, device):
         labels.append(label)
     labels = torch.tensor(labels, device=device)
 
-    lc = nn.Linear(4 * CFG["d_sae"], len(CONTROL_CLASSES)).to(device)
+    # One RD condition against three others: weight each class by 1 / its share of the pairs,
+    # so both classes count equally in the loss
+    class_weights = []
+    for c in range(len(CLASSES)):
+        count = int((labels == c).sum())
+        if count == 0:
+            raise ValueError(f"no training pairs of class '{CLASSES[c]}'")
+        class_weights.append(len(labels) / (len(CLASSES) * count))
+    class_weights = torch.tensor(class_weights, device=device)
+
+    lc = nn.Linear(4 * CFG["d_sae"], len(CLASSES)).to(device)
     optimizer = torch.optim.AdamW(lc.parameters(), lr=CFG["lc_lr"], weight_decay=CFG["lc_weight_decay"])
 
     # TE and SAE are frozen and crops are fixed, so every crop's latents are computed once
@@ -450,7 +455,7 @@ def train_lc(te, sae, pairs, device):
         for start in range(0, len(labels), CFG["lc_batch_size"]):
             idx = order[start:start + CFG["lc_batch_size"]]
             logits = lc(features[idx])
-            loss = F.cross_entropy(logits, labels[idx])
+            loss = F.cross_entropy(logits, labels[idx], weight=class_weights)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -458,28 +463,36 @@ def train_lc(te, sae, pairs, device):
     return lc
 
 
-# Run the three training stages in order and save the checkpoint
+# Leave-one-well-out: for each fold, train the three stages from scratch on that fold's training
+# wells and save a checkpoint; infer.py then runs each checkpoint on its held-out wells
 def train():
     device = CFG["device"]
-    torch.manual_seed(CFG["seed"])
-
     te = load_frozen_dinov3_single_channel(CFG["dinov3_repo_dir"], CFG["dinov3_weights"], device)
-    train_singles, val_singles, train_pairs, val_pairs = build_splits(CFG["crop_dir"])
+    CFG["ckpt_dir"].mkdir(parents=True, exist_ok=True)
 
-    sae = train_sae(te, train_singles, device)
-    td = train_td(te, sae, train_singles, device)
-    lc = train_lc(te, sae, train_pairs, device)
+    for fold in range(len(FOLD_COLUMNS)):
+        torch.manual_seed(CFG["seed"])
+        train_singles, train_pairs, heldout_pairs = build_fold(CFG["crop_dir"], fold, CFG["max_pair_dist_px"])
+        print(f"fold {fold + 1}: held-out column {FOLD_COLUMNS[fold]}, "
+              f"{len(train_singles)} training crops, {len(train_pairs)} training pairs, "
+              f"{len(heldout_pairs)} held-out pairs")
 
-    torch.save(
-        {
-            "cfg": CFG,
-            "classes": CONTROL_CLASSES,
-            "sae": sae.state_dict(),
-            "td": td.state_dict(),
-            "lc": lc.state_dict(),
-        },
-        CFG["ckpt_out"],
-    )
+        sae = train_sae(te, train_singles, device)
+        td = train_td(te, sae, train_singles, device)
+        lc = train_lc(te, sae, train_pairs, device)
+
+        torch.save(
+            {
+                "cfg": CFG,
+                "classes": CLASSES,
+                "fold": fold + 1,
+                "held_out_column": FOLD_COLUMNS[fold],
+                "sae": sae.state_dict(),
+                "td": td.state_dict(),
+                "lc": lc.state_dict(),
+            },
+            CFG["ckpt_dir"] / f"fold{fold + 1}.pt",
+        )
 
 
 if __name__ == "__main__":

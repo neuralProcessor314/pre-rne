@@ -10,18 +10,19 @@
    - **Stage 3**: Train a linear classifier (`LC`) directly on spatially pooled `z` (with no intermediate cross-channel convolution) while keeping `TE` and `SAE` frozen.
 4. **Inference Sparsity**: Remove `BatchTopK` during inference (`infer.py`).
 5. **Dataset Conditions, Pairing, and Splits**:
-   - Organize data into `before`, `control` (`DD` DMSO + DMSO, `DF` DMSO + ferrostatin, `RF` RSL3 + ferrostatin), and `test` (`RD` RSL3 + DMSO, the only ferroptotic condition), with comparable sample counts per condition. DMSO is diluted in the same ratio as the other compounds.
+   - Organize data into `before` and `after`, each by condition: `DD` DMSO + DMSO, `DF` DMSO + ferrostatin, `RF` RSL3 + ferrostatin (not ferroptotic), and `RD` RSL3 + DMSO (the only ferroptotic condition), with comparable sample counts per condition. DMSO is diluted in the same ratio as the other compounds.
    - Pair `before` images with their corresponding post-treatment images.
-   - Split train, validation, and test sets by well groups.
+   - Split by well groups (see decision 12).
 6. **Scripts and Hyperparameters**:
    - Implement channel separation in a Windows batch file (`colorsep.bat`) using ImageMagick.
    - Implement Cellpose-SAM segmentation in `segment.py` reading from `data/raw/`.
    - Provide minimal single-file PyTorch scripts for training (`train.py`) and inference (`infer.py`) with every hyperparameter, including model dimensions, left empty (`None`).
-7. **Inference Outputs**: Export `LC` predictions, pooled sparse latents `z`, baseline `TD` reconstructions, and latent-intervened `TD` reconstructions on `test` (`RD`).
+7. **Inference Outputs**: Export `LC` predictions, pooled sparse latents `z`, baseline `TD` reconstructions, and latent-intervened `TD` reconstructions on the held-out wells of every fold.
 8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells. Segment single cells, not cell groups.
 9. **Per-Image Brightfield Normalisation**: Normalise each input image's mean RGB and contrast, centring each channel at 0.5 (128 on an 8-bit scale).
 10. **Augmentation Before Cellpose**: Augment whole images after normalisation and before Cellpose segmentation, with rotation by multiples of 90° plus flips, Gaussian noise, Gaussian blur, and realistic microscope artefacts (chromatic aberration, uneven illumination). No crop augmentation.
 11. **Concentration 1.0 Dropped**: Every cell at concentration 1.0 was already dead, so the 1.0 wells are not used. The remaining wells keep their 24-well plate numbers (1–4, 7–10, 13–16, 19–22).
+12. **Binary Labels and Leave-One-Well-Out**: `RD` is the only ferroptotic condition and must be in training. `LC` predicts ferroptotic (`RD`) versus not ferroptotic (`DD`, `DF`, `RF`). Evaluation is leave-one-well-out over 4 folds: each well of every condition is held out once, and all three stages are retrained for each fold.
 
 ## Derived Architecture and Pipeline Assumptions
 
@@ -30,7 +31,7 @@
 - Concentrations are pooled into one class per code; a well is identified as `<code>_<side><conc>` (e.g. `DD_L0.5`); each well is one split group.
 - Raw files sit directly in `data/raw/` (no subfolders), named `<phase><code>_<side><conc>_<fov>.png` with `<conc>` one of `0.1`, `0.5`, or `<phase>W<well>_<fov>.png`; phase `b` = before brightfield, `a` = after brightfield, `f` = after BODIPY. `<fov>` indexes the same field before and after. `W<well>` files are skipped until `row_codes` is set; other names are skipped and printed.
 - `colorsep.bat` writes `data/sep/<stem>_c0.png`, `<stem>_c1.png`, `<stem>_c2.png` (R, G, B) for each RGB file in `data/raw/`.
-- `segment.py` writes `data/crops/{before|control|test}/<code>/<well>_<fov>_cell<idx>.pt` containing `{"image": Tensor[4, S, S], "centroid": Tensor[2], "area": Tensor[]}`, where `S` is a multiple of 16 that varies per cell and `area` is the mask pixel count.
+- `segment.py` writes `data/crops/{before|after}/<code>/<well>_<fov>_cell<idx>.pt` containing `{"image": Tensor[4, S, S], "centroid": Tensor[2], "area": Tensor[]}`, where `S` is a multiple of 16 that varies per cell and `area` is the mask pixel count.
 
 ### 2. Channel Separation and Intensity Conversion
 - `colorsep.bat` runs `magick <file> -alpha off -channel RGB -separate -define png:color-type=0 <stem>_c%d.png`, keeping the input bit depth; `segment.py` reads 8- or 16-bit from the PNG mode.
@@ -42,7 +43,7 @@
 - `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), with the `cpsam` weights in Cellpose's default `<home>/.cellpose/models/`, pads each mask's bounding box by `pad_px`, and cuts a square window from the 4-channel stack with no resizing: the side is the padded box's longer side rounded up to a multiple of the 16-pixel patch size, the window is centred on the box, and it is shifted back inside the image where it would stick out (such cells sit off-centre). Cells whose square would be larger than the image are skipped. Neighbouring cells inside the window are not masked out. After brightfield images without a matching BODIPY file are skipped.
 - Failure mode: masks cut by the image border understate cell size; such cells are kept.
 - After cell groups pair with before cell groups of the same `(well, fov)` at the nearest mask centroid within `max_pair_dist_px`.
-- `RD` wells (before and after) are excluded from all training; control wells are split into train and validation per condition by `val_well_frac`.
+- Folds follow plate columns: fold k holds out the wells of column `FOLD_COLUMNS[k]` (`L0.1`, `R0.1`, `L0.5`, `R0.5`) in all four conditions, one well per condition, and trains on the other three columns. Each fold's checkpoint is `checkpoints/fold<k>.pt`; `infer.py` runs each fold's models on that fold's held-out wells only, with their original images (no augmented copies).
 - Failure mode: stage drift or cell migration between before and after imaging breaks centroid correspondence; unmatched crops are skipped during Stage 3 training and omitted from paired inference.
 
 ### 4. DINOv3 Backbone (`TE`)
@@ -55,7 +56,7 @@
 
 ### 6. Decoder and Classifier Tensor Routing (`TD` and `LC`)
 - Stage 2 trains `TD` (Transformer encoder blocks over `x_pred` followed by linear projection and `PixelShuffle(patch_size)`) per channel to reconstruct the 4-channel crop.
-- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Pooled latents use the `theta` threshold and are computed once, since `TE`, `SAE` and the crops are fixed.
+- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` with 2 outputs (not ferroptotic, ferroptotic). With one `RD` condition against three others, the cross-entropy weights each class by 1 / (its share of training pairs × 2), so both classes count equally. Pooled latents use the `theta` threshold and are computed once, since `TE`, `SAE` and the crops are fixed.
 - Averaging over patches removes cell size from the pooled latents; `LC` does not read `area`.
 
 ### 7. Variable Crop Sizes
@@ -63,8 +64,8 @@
 - Failure mode: a side length with few crops yields small batches, so `BatchTopK` there behaves closer to per-crop TopK.
 
 ### 8. Augmentation (`segment.py`, before Cellpose)
-- Order per image: load, normalise brightfield, build the 4-channel stack, then segment the stack itself and, outside the test condition (`RD`), `aug_copies` augmented copies of it. Each copy is segmented by Cellpose on its own and its crops are saved under FOV `<fov>-aug<copy>` (e.g. `3-aug1`). `RD` images are never augmented, so `infer.py` sees original images only.
+- Order per image: load, normalise brightfield, build the 4-channel stack, then segment the stack itself and `aug_copies` augmented copies of it, in every condition. Each copy is segmented by Cellpose on its own and its crops are saved under FOV `<fov>-aug<copy>` (e.g. `3-aug1`). Every well is a training well in three of the four folds, so every condition is augmented.
 - Steps, in order: rotation by 0/90/180/270° and a mirror flip half of the time (all channels); chromatic aberration, shifting R and B against G by up to `aug_ca_max_shift_px` pixels with edge pixels repeated; uneven illumination, multiplying R, G, B by a linear ramp across the image in a random direction with slope up to `aug_illum_max_slope`; Gaussian blur on all channels with sigma up to `aug_blur_max_sigma`; Gaussian noise with standard deviation up to `aug_noise_max_std` on R, G, B, and on BODIPY only for after images (before images have no BODIPY image). Each strength is drawn uniformly from 0 to its maximum; the result is clipped to [0, 1].
 - The before and after image of the same `(well, fov)` and copy draw from one generator seeded by `seed`, well, FOV and copy number, so both get the same rotation, flip and strengths. Their cells therefore still line up for centroid pairing, which only compares crops of the same `(well, fov)` and copy.
-- `train.py` uses augmented copies for training only: in validation wells only the original crops are kept. Training itself does no further augmentation.
-- Failure mode: augmentation is fixed when `segment.py` runs, so every epoch sees the same `1 + aug_copies` versions of each image; Cellpose runs `1 + aug_copies` times per non-test image.
+- `train.py` uses augmented copies only while a well is a training well; for its held-out fold only the original crops are used. Training itself does no further augmentation.
+- Failure mode: augmentation is fixed when `segment.py` runs, so every epoch sees the same `1 + aug_copies` versions of each image; Cellpose runs `1 + aug_copies` times per image.
