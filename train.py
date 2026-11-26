@@ -3,7 +3,6 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 
 # Model dimensions, paths, and training hyperparameters
 CFG = {
@@ -146,31 +145,36 @@ def build_splits(crop_dir):
     return train_singles, val_singles, train_pairs, val_pairs
 
 
-# One crop image per item (Stages 1-2)
-class SingleCropDataset(Dataset):
-    def __init__(self, paths):
-        self.paths = paths
+# Crops are not resized, so their sizes differ, and crops of different sizes cannot share a batch.
+# Group crop paths by side length: {side: [paths]}
+def group_by_side(paths):
+    groups = {}
+    for path in paths:
+        side = torch.load(path, weights_only=True)["image"].shape[-1]
+        if side not in groups:
+            groups[side] = []
+        groups[side].append(path)
+    return groups
 
-    def __len__(self):
-        return len(self.paths)
 
-    def __getitem__(self, idx):
-        return torch.load(self.paths[idx], weights_only=True)["image"]
+# Shuffle each size group, cut it into batches, then shuffle the order of the batches
+def make_batches(groups, batch_size, rng):
+    batches = []
+    for side in sorted(groups):
+        paths = list(groups[side])
+        rng.shuffle(paths)
+        for start in range(0, len(paths), batch_size):
+            batches.append(paths[start:start + batch_size])
+    rng.shuffle(batches)
+    return batches
 
 
-# One (before image, after image, label) pair per item (Stage 3)
-class PairedCropDataset(Dataset):
-    def __init__(self, pairs):
-        self.pairs = pairs
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        before_path, after_path, label = self.pairs[idx]
-        before = torch.load(before_path, weights_only=True)["image"]
-        after = torch.load(after_path, weights_only=True)["image"]
-        return before, after, label
+# Load the images of same-sized crops as one tensor (B, 4, side, side)
+def load_images(paths):
+    images = []
+    for path in paths:
+        images.append(torch.load(path, weights_only=True)["image"])
+    return torch.stack(images)
 
 
 # ---------------- Models ----------------
@@ -334,12 +338,14 @@ def train_sae(te, image_paths, device):
         topk_aux=CFG["topk_aux"],
         dead_steps=CFG["dead_steps"],
     ).to(device)
-    loader = DataLoader(SingleCropDataset(image_paths), batch_size=CFG["sae_batch_size"], shuffle=True)
+    groups = group_by_side(image_paths)
+    rng = random.Random(CFG["seed"])
     optimizer = torch.optim.AdamW(sae.parameters(), lr=CFG["sae_lr"])
 
     sae.train()
     for epoch in range(CFG["sae_epochs"]):
-        for imgs in loader:
+        for batch_paths in make_batches(groups, CFG["sae_batch_size"], rng):
+            imgs = load_images(batch_paths)
             tokens, hp, wp = encode_four_channels(te, imgs.to(device))
             tokens = tokens.reshape(-1, d_in)       # all patch tokens of all channels
             recon_loss, aux_loss = sae.training_losses(tokens)
@@ -364,13 +370,14 @@ def train_td(te, sae, image_paths, device):
         td_layers=CFG["td_layers"],
         td_mlp_dim=CFG["td_mlp_dim"],
     ).to(device)
-    loader = DataLoader(SingleCropDataset(image_paths), batch_size=CFG["td_batch_size"], shuffle=True)
+    groups = group_by_side(image_paths)
+    rng = random.Random(CFG["seed"])
     optimizer = torch.optim.AdamW(td.parameters(), lr=CFG["td_lr"])
 
     td.train()
     for epoch in range(CFG["td_epochs"]):
-        for imgs in loader:
-            imgs = imgs.to(device)
+        for batch_paths in make_batches(groups, CFG["td_batch_size"], rng):
+            imgs = load_images(batch_paths).to(device)
             with torch.no_grad():
                 tokens, hp, wp = encode_four_channels(te, imgs)
                 b, c, t, d = tokens.shape
@@ -387,27 +394,57 @@ def train_td(te, sae, image_paths, device):
     return td
 
 
+# Patch-averaged SAE latents of each crop: {path: Tensor[4 * d_sae]}
+# Uses the inference threshold (as infer.py does), so a crop's latents do not depend on
+# which other crops share its batch. Before and after crops of one cell usually differ in size.
+def pooled_latents(te, sae, paths, batch_size, device):
+    groups = group_by_side(paths)
+    latents = {}
+    with torch.no_grad():
+        for side in sorted(groups):
+            group = groups[side]
+            for start in range(0, len(group), batch_size):
+                batch_paths = group[start:start + batch_size]
+                imgs = load_images(batch_paths).to(device)
+                tokens, hp, wp = encode_four_channels(te, imgs)
+                b, c, t, d = tokens.shape
+                z = sae.encode_threshold(tokens.reshape(-1, d))
+                pooled = pool_over_patches(z, b, c, t)
+                for i in range(b):
+                    latents[batch_paths[i]] = pooled[i]
+    return latents
+
+
 # Stage 3: train LC on the before -> after change of patch-averaged SAE latents (TE and SAE frozen)
 def train_lc(te, sae, pairs, device):
+    # TE and SAE are frozen, so every crop's latents are computed once and reused in every epoch
+    crop_paths = []
+    seen = set()
+    for before_path, after_path, label in pairs:
+        for path in [before_path, after_path]:
+            if path not in seen:
+                seen.add(path)
+                crop_paths.append(path)
+    latents = pooled_latents(te, sae, crop_paths, CFG["lc_batch_size"], device)
+
+    features = []
+    labels = []
+    for before_path, after_path, label in pairs:
+        features.append(latents[after_path] - latents[before_path])
+        labels.append(label)
+    features = torch.stack(features)                          # (N, 4 * d_sae)
+    labels = torch.tensor(labels, device=device)
+
     lc = nn.Linear(4 * CFG["d_sae"], len(CONTROL_CLASSES)).to(device)
-    loader = DataLoader(PairedCropDataset(pairs), batch_size=CFG["lc_batch_size"], shuffle=True)
     optimizer = torch.optim.AdamW(lc.parameters(), lr=CFG["lc_lr"], weight_decay=CFG["lc_weight_decay"])
 
     lc.train()
     for epoch in range(CFG["lc_epochs"]):
-        for before, after, labels in loader:
-            before = before.to(device)
-            after = after.to(device)
-            labels = labels.to(device)
-            with torch.no_grad():
-                tok_before, hp, wp = encode_four_channels(te, before)
-                tok_after, hp, wp = encode_four_channels(te, after)
-                b, c, t, d = tok_before.shape
-                z_before = sae.encode_batch_topk(tok_before.reshape(-1, d))
-                z_after = sae.encode_batch_topk(tok_after.reshape(-1, d))
-                feat = pool_over_patches(z_after, b, c, t) - pool_over_patches(z_before, b, c, t)
-            logits = lc(feat)
-            loss = F.cross_entropy(logits, labels)
+        order = torch.randperm(len(labels), device=device)
+        for start in range(0, len(labels), CFG["lc_batch_size"]):
+            idx = order[start:start + CFG["lc_batch_size"]]
+            logits = lc(features[idx])
+            loss = F.cross_entropy(logits, labels[idx])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

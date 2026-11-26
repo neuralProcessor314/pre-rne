@@ -2,7 +2,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
-import torch.nn.functional as F
 from cellpose import models
 
 from train import TEST_CODE
@@ -14,7 +13,6 @@ CFG = {
     "row_codes": None,          # list[str]: condition code of plate rows 1-4, e.g. ["RD", "DD", "RF", "DF"]
     "fluo_weights": None,       # (wR, wG, wB): BODIPY channel = wR*R + wG*G + wB*B
     "bf_white": None,           # float: brightfield transmittance that becomes 1.0
-    "crop_size": None,          # int: square crop side length, multiple of 16
     "min_mask_pixels": None,    # int: minimum cell-group mask area
     "pad_px": None,             # int: bounding-box padding in pixels
     "flow_threshold": None,     # float: Cellpose flow error threshold
@@ -22,6 +20,8 @@ CFG = {
     "batch_size": None,         # int: Cellpose evaluation batch size
     "gpu": True,
 }
+
+PATCH_SIZE = 16     # DINOv3 ViT-B/16 patch side; crop sides must be a multiple of it
 
 CODES = ["RD", "DD", "RF", "DF"]
 CONCENTRATIONS = ["0.1", "0.5", "1.0"]
@@ -149,7 +149,31 @@ def bodipy_scale(names):
     return scale
 
 
-# Segment cells on the 3 brightfield channels and save each cell group as a resized 4-channel crop
+# Turn a padded bounding box into a square window of real image pixels (no resizing)
+# The side is the box's longer side rounded up to a multiple of PATCH_SIZE; the window is
+# centred on the box and moved back inside the image if it sticks out.
+# Returns (top, bottom, left, right), or None if the square is larger than the image.
+def square_window(y0, y1, x0, x1, height, width):
+    side = max(y1 - y0, x1 - x0)
+    if side % PATCH_SIZE != 0:
+        side = side + PATCH_SIZE - side % PATCH_SIZE
+    if side > height or side > width:
+        return None
+
+    top = (y0 + y1) // 2 - side // 2
+    left = (x0 + x1) // 2 - side // 2
+    if top < 0:
+        top = 0
+    if left < 0:
+        left = 0
+    if top + side > height:
+        top = height - side
+    if left + side > width:
+        left = width - side
+    return top, top + side, left, left + side
+
+
+# Segment cells on the 3 brightfield channels and save each cell group as a square 4-channel crop
 def segment_and_save(model, stack, out_dir, well, fov):
     masks, flows, styles = model.eval(
         stack[:3],
@@ -167,19 +191,24 @@ def segment_and_save(model, stack, out_dir, well, fov):
         if len(ys) < CFG["min_mask_pixels"]:
             continue
 
-        # Padded bounding box, kept inside the image
-        y0 = max(0, ys.min() - CFG["pad_px"])
-        y1 = min(height, ys.max() + 1 + CFG["pad_px"])
-        x0 = max(0, xs.min() - CFG["pad_px"])
-        x1 = min(width, xs.max() + 1 + CFG["pad_px"])
+        # Padded bounding box, then squared with the surrounding pixels
+        y0 = int(ys.min()) - CFG["pad_px"]
+        y1 = int(ys.max()) + 1 + CFG["pad_px"]
+        x0 = int(xs.min()) - CFG["pad_px"]
+        x1 = int(xs.max()) + 1 + CFG["pad_px"]
+        window = square_window(y0, y1, x0, x1, height, width)
+        if window is None:
+            print(f"cell larger than the image, skipped: {well} FOV {fov} cell {cell_id}")
+            continue
+        top, bottom, left, right = window
 
-        crop = torch.from_numpy(stack[:, y0:y1, x0:x1]).unsqueeze(0)    # (1, 4, h, w)
-        crop = F.interpolate(crop, size=(CFG["crop_size"], CFG["crop_size"]), mode="bilinear", align_corners=False)
-        crop = crop.squeeze(0)                                           # (4, crop_size, crop_size)
+        # copy() so the saved file holds only the crop, not the whole image behind it
+        crop = torch.from_numpy(stack[:, top:bottom, left:right].copy())   # (4, side, side)
 
         centroid = torch.tensor([float(ys.mean()), float(xs.mean())])
+        area = torch.tensor(len(ys))                                          # mask pixel count
         out_path = out_dir / f"{well}_{fov}_cell{cell_id:04d}.pt"
-        torch.save({"image": crop, "centroid": centroid}, out_path)
+        torch.save({"image": crop, "centroid": centroid, "area": area}, out_path)
 
 
 # Build 4-channel images (brightfield R, G, B + BODIPY) and save cell crops for every FOV

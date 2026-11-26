@@ -18,6 +18,7 @@
    - Implement Cellpose-SAM segmentation in `segment.py` reading from `data/raw/`.
    - Provide minimal single-file PyTorch scripts for training (`train.py`) and inference (`infer.py`) with every hyperparameter, including model dimensions, left empty (`None`).
 7. **Inference Outputs**: Export `LC` predictions, pooled sparse latents `z`, baseline `TD` reconstructions, and latent-intervened `TD` reconstructions on `test` (`RD`).
+8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells.
 
 ## Derived Architecture and Pipeline Assumptions
 
@@ -26,7 +27,7 @@
 - Concentrations are pooled into one class per code; a well is identified as `<code>_<side><conc>` (e.g. `DD_L0.5`); each well is one split group.
 - Raw files sit directly in `data/raw/` (no subfolders), named `<phase><code>_<side><conc>_<fov>.png` with `<conc>` one of `0.1`, `0.5`, `1.0`, or `<phase>W<well>_<fov>.png`; phase `b` = before brightfield, `a` = after brightfield, `f` = after BODIPY. `<fov>` indexes the same field before and after. `W<well>` files are skipped until `row_codes` is set; other names are skipped and printed.
 - `colorsep.bat` writes `data/sep/<stem>_c0.png`, `<stem>_c1.png`, `<stem>_c2.png` (R, G, B) for each RGB file in `data/raw/`.
-- `segment.py` writes `data/crops/{before|control|test}/<code>/<well>_<fov>_cell<idx>.pt` containing `{"image": Tensor[4, H, W], "centroid": Tensor[2]}`.
+- `segment.py` writes `data/crops/{before|control|test}/<code>/<well>_<fov>_cell<idx>.pt` containing `{"image": Tensor[4, S, S], "centroid": Tensor[2], "area": Tensor[]}`, where `S` is a multiple of 16 that varies per cell and `area` is the mask pixel count.
 
 ### 2. Channel Separation and Intensity Conversion
 - `colorsep.bat` runs `magick <file> -alpha off -channel RGB -separate -define png:color-type=0 <stem>_c%d.png`, keeping the input bit depth; `segment.py` reads 8- or 16-bit from the PNG mode.
@@ -35,7 +36,8 @@
 - Failure mode: saturated pixels break the multiplicative brightfield model; BODIPY 581/591 C11 shifts emission from red to green on oxidation, so one linear channel cannot carry the oxidised/reduced ratio.
 
 ### 3. Segmentation, Pairing, and Splits
-- `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), crops each mask's padded bounding box from the 4-channel stack, and resizes it to `crop_size` (a multiple of the 16-pixel patch size). After brightfield images without a matching BODIPY file are skipped.
+- `segment.py` runs `cellpose.models.CellposeModel(pretrained_model="cpsam")` on the 3 brightfield channels (`channel_axis=0`), pads each mask's bounding box by `pad_px`, and cuts a square window from the 4-channel stack with no resizing: the side is the padded box's longer side rounded up to a multiple of the 16-pixel patch size, the window is centred on the box, and it is shifted back inside the image where it would stick out (such cells sit off-centre). Cells whose square would be larger than the image are skipped. Neighbouring cells inside the window are not masked out. After brightfield images without a matching BODIPY file are skipped.
+- Failure mode: masks cut by the image border understate cell size; such cells are kept.
 - After cell groups pair with before cell groups of the same `(well, fov)` at the nearest mask centroid within `max_pair_dist_px`.
 - `RD` wells (before and after) are excluded from all training; control wells are split into train and validation per condition by `val_well_frac`.
 - Failure mode: stage drift or cell migration between before and after imaging breaks centroid correspondence; unmatched crops are skipped during Stage 3 training and omitted from paired inference.
@@ -46,8 +48,13 @@
 
 ### 5. Inference Threshold Calibration (`SAE`)
 - Removing `BatchTopK` without a threshold leaves unconstrained `ReLU` activations (`h = F.relu(encoder(x - b_dec))`), shifting the sparsity distribution seen by `LC` and `TD`.
-- `train.py` tracks the running mean `theta` of the minimum positive retained activation per training batch so `infer.py` applies `JumpReLU` (`h * (h > theta)`) for batch-size-independent sparsity.
+- `train.py` tracks the running mean `theta` of the minimum positive retained activation per training batch so Stage 3 and `infer.py` apply `JumpReLU` (`h * (h > theta)`) for batch-size-independent sparsity. Stages 1 and 2 keep `BatchTopK`.
 
 ### 6. Decoder and Classifier Tensor Routing (`TD` and `LC`)
 - Stage 2 trains `TD` (Transformer encoder blocks over `x_pred` followed by linear projection and `PixelShuffle(patch_size)`) per channel to reconstruct the 4-channel crop.
-- Stage 3 averages patch-level `z` spatially over `(H_p, W_p)`, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`.
+- Stage 3 averages each crop's patch-level `z` over its own `(H_p, W_p)` grid, computes the paired difference `z_after - z_before` per channel, concatenates all 4 channels into shape `(B, 4 * d_sae)`, and trains `LC` across `DD`, `DF`, and `RF`. Because `TE` and `SAE` are frozen, each crop's pooled latents are computed once and reused every epoch.
+- Averaging over patches removes cell size from the pooled latents; `LC` does not read `area`.
+
+### 7. Variable Crop Sizes
+- Crops of different sizes cannot be stacked into one tensor. Stages 1 and 2 group crops by side length and draw each batch from one group; Stage 3 computes latents group by group; `infer.py` processes one before/after pair at a time.
+- Failure mode: a side length with few crops yields small batches, so `BatchTopK` there behaves closer to per-crop TopK.
