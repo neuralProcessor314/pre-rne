@@ -21,13 +21,14 @@
 8. **Cell Crops Keep Cell Size**: Do not resize cell crops. Square each Cellpose bounding box with the surrounding image pixels, so crop sizes differ between cells. Segment single cells, not cell groups.
 9. **Per-Image Brightfield Normalisation**: Normalise each input image's mean RGB and contrast, centring each channel at 0.5 (128 on an 8-bit scale).
 10. **Training Augmentation**: Augment training crops in all three stages with rotation by multiples of 90° plus flips, Gaussian noise, Gaussian blur, and realistic microscope artefacts (chromatic aberration, uneven illumination). No crop augmentation.
+11. **Concentration 1.0 Dropped**: Every cell at concentration 1.0 was already dead, so the 1.0 wells are not used. The remaining wells keep their 24-well plate numbers (1–4, 7–10, 13–16, 19–22).
 
 ## Derived Architecture and Pipeline Assumptions
 
 ### 1. Plate Layout and File Naming
-- One 24-well plate; wells 1–24 numbered row-major over 4 rows × 6 columns, columns in order `0.1L`, `0.1R`, `0.5L`, `0.5R`, `1.0L`, `1.0R`; each row holds one condition code, with the row order set in `segment.py` `row_codes`.
+- One 24-well plate; wells 1–24 numbered row-major over 4 rows × 6 columns, columns in order `0.1L`, `0.1R`, `0.5L`, `0.5R`, `1.0L`, `1.0R`; the `1.0` columns (wells 5, 6, 11, 12, 17, 18, 23, 24) are dropped and their files are skipped; each row holds one condition code, with the row order set in `segment.py` `row_codes`.
 - Concentrations are pooled into one class per code; a well is identified as `<code>_<side><conc>` (e.g. `DD_L0.5`); each well is one split group.
-- Raw files sit directly in `data/raw/` (no subfolders), named `<phase><code>_<side><conc>_<fov>.png` with `<conc>` one of `0.1`, `0.5`, `1.0`, or `<phase>W<well>_<fov>.png`; phase `b` = before brightfield, `a` = after brightfield, `f` = after BODIPY. `<fov>` indexes the same field before and after. `W<well>` files are skipped until `row_codes` is set; other names are skipped and printed.
+- Raw files sit directly in `data/raw/` (no subfolders), named `<phase><code>_<side><conc>_<fov>.png` with `<conc>` one of `0.1`, `0.5`, or `<phase>W<well>_<fov>.png`; phase `b` = before brightfield, `a` = after brightfield, `f` = after BODIPY. `<fov>` indexes the same field before and after. `W<well>` files are skipped until `row_codes` is set; other names are skipped and printed.
 - `colorsep.bat` writes `data/sep/<stem>_c0.png`, `<stem>_c1.png`, `<stem>_c2.png` (R, G, B) for each RGB file in `data/raw/`.
 - `segment.py` writes `data/crops/{before|control|test}/<code>/<well>_<fov>_cell<idx>.pt` containing `{"image": Tensor[4, S, S], "centroid": Tensor[2], "area": Tensor[]}`, where `S` is a multiple of 16 that varies per cell and `area` is the mask pixel count.
 

@@ -25,9 +25,10 @@ CFG = {
 PATCH_SIZE = 16     # DINOv3 ViT-B/16 patch side; crop sides must be a multiple of it
 
 CODES = ["RD", "DD", "RF", "DF"]
-CONCENTRATIONS = ["0.1", "0.5", "1.0"]
+CONCENTRATIONS = ["0.1", "0.5"]     # 1.0 dropped: every cell was already dead
 
 # Plate columns from left to right: (side, concentration)
+# The 1.0 columns (wells 5, 6, 11, 12, 17, 18, 23, 24) stay in the list so well numbers keep their plate positions
 COLUMNS = [("L", "0.1"), ("R", "0.1"), ("L", "0.5"), ("R", "0.5"), ("L", "1.0"), ("R", "1.0")]
 
 
@@ -61,6 +62,9 @@ def parse_name(name):
         number = int(number_text)
         if number < 1 or number > 24:
             return None
+        side, conc = COLUMNS[(number - 1) % 6]
+        if conc not in CONCENTRATIONS:
+            return None        # well of a dropped concentration
         return phase, well_name_from_number(number), str(int(fov))
 
     # Named form: <code>_<side><conc>_<fov>
